@@ -32,6 +32,8 @@ import sys
 import threading
 import time
 import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
 
 try:
     import tkinter as tk
@@ -964,6 +966,48 @@ def host_prefix_of(token):
     return ''.join(parts[:2 * k - 1])
 
 
+def _local(tag):
+    return tag.rsplit('}', 1)[-1]
+
+
+def read_xlsx_text(path):
+    """All cell values of every sheet in an .xlsx, one per line."""
+    try:
+        z = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        raise ScrubError('%s is not an .xlsx file (old .xls files must be '
+                         'saved as .xlsx or CSV first).'
+                         % os.path.basename(path))
+    with z:
+        shared = []
+        if 'xl/sharedStrings.xml' in z.namelist():
+            for si in ET.fromstring(z.read('xl/sharedStrings.xml')):
+                shared.append(''.join(t.text or '' for t in si.iter()
+                                      if _local(t.tag) == 't'))
+        values = []
+        for name in sorted(z.namelist()):
+            if not re.match(r'xl/worksheets/sheet\d+\.xml$', name):
+                continue
+            for c in ET.fromstring(z.read(name)).iter():
+                if _local(c.tag) != 'c':
+                    continue
+                kind = c.get('t')
+                if kind == 'inlineStr':
+                    values.append(''.join(t.text or '' for t in c.iter()
+                                          if _local(t.tag) == 't'))
+                    continue
+                v = next((x.text for x in c if _local(x.tag) == 'v'), None)
+                if v is None:
+                    continue
+                if kind == 's':
+                    try:
+                        v = shared[int(v)]
+                    except (ValueError, IndexError):
+                        continue
+                values.append(v)
+    return '\n'.join(values)
+
+
 def hostnames_in(text):
     """Hostname-shaped tokens (3+ blocks, digits only at the end)."""
     out = []
@@ -1308,7 +1352,9 @@ class App(object):
         self.b_scan = ttk.Button(bar, text='Scan inputs', command=self._scan)
         self.b_scan.pack(side='left')
         ttk.Button(bar, text='Import node list...',
-                   command=self._import_nodes).pack(side='left', padx=4)
+                   command=self._import_nodes).pack(side='left', padx=(4, 0))
+        ttk.Button(bar, text='Paste node list...',
+                   command=self._paste_nodes).pack(side='left', padx=4)
         self.v_quick = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, variable=self.v_quick,
                         text='Quick (first %d MB of each file)'
@@ -1954,14 +2000,55 @@ class App(object):
     def _import_nodes(self):
         path = filedialog.askopenfilename(
             title='Node / hostname list', filetypes=[
-                ('Text or CSV', '*.txt *.csv'), ('All files', '*.*')])
+                ('Excel, text or CSV', '*.xlsx *.xlsm *.txt *.csv'),
+                ('All files', '*.*')])
         if not path:
             return
         try:
-            with _open_in(path) as fh:
-                names = set(hostnames_in(fh.read()))
-        except OSError as e:
+            if path.lower().endswith(('.xlsx', '.xlsm')):
+                text = read_xlsx_text(path)
+            elif path.lower().endswith('.xls'):
+                raise ScrubError('Old .xls files are not supported; save it '
+                                 'as .xlsx or CSV, or use Paste node list.')
+            else:
+                with _open_in(path) as fh:
+                    text = fh.read()
+        except (OSError, ScrubError, ET.ParseError) as e:
             messagebox.showerror('Import', str(e))
+            return
+        self._add_nodes(text, os.path.basename(path))
+
+    def _paste_nodes(self):
+        d = tk.Toplevel(self.root)
+        d.title('Paste node list')
+        d.transient(self.root)
+        frm = ttk.Frame(d, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text='Paste hostnames (e.g. a column copied from '
+                  'Excel). Anything that is not hostname-shaped is ignored.'
+                  ).pack(anchor='w')
+        t = tk.Text(frm, width=60, height=20, font=self.mono)
+        t.pack(fill='both', expand=True, pady=4)
+
+        def ok():
+            text = t.get('1.0', 'end')
+            d.destroy()
+            self._add_nodes(text, 'pasted list')
+        bf = ttk.Frame(frm)
+        bf.pack(anchor='e')
+        ttk.Button(bf, text='OK', command=ok).pack(side='left', padx=4)
+        ttk.Button(bf, text='Cancel', command=d.destroy).pack(side='left')
+        d.bind('<Escape>', lambda e: d.destroy())
+        t.focus_set()
+        d.grab_set()
+        d.wait_window()
+
+    def _add_nodes(self, text, source):
+        """Add hostname prefixes from a node list to the scan results."""
+        names = set(hostnames_in(text))
+        if not names:
+            messagebox.showinfo('Node list', 'No hostname-shaped names '
+                                '(like A-B-EE-AS1) found in %s.' % source)
             return
         if self.found is None:
             self.found = empty_found()
@@ -1972,10 +2059,14 @@ class App(object):
                 hosts[p][0] += 1
             else:
                 hosts[p] = [1, name]
-        self._log('Node list %s: %d hostname(s), %d prefix(es).'
-                  % (os.path.basename(path), len(names),
-                     len({host_prefix_of(n).upper() for n in names})))
+        msg = ('Node list (%s): %d hostname(s), %d prefix(es). Check them in '
+               'the Hostname group and Add checked to rules; they are then '
+               'saved, so this is only needed once.'
+               % (source, len(names),
+                  len({host_prefix_of(n).upper() for n in names})))
+        self._log(msg)
         self._render_scan()
+        self.v_status.set(msg)
         self.nb.select(0)
 
     # ------------------------------------------------------------ test
