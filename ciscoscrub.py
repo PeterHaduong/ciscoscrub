@@ -925,7 +925,8 @@ def run(inputs, cfg, out_dir=None, report_path=None,
 
 _IP4_ANY = re.compile(r'(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)')
 _IP6_CAND = re.compile(r'[0-9A-Fa-f]{1,4}:[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*')
-_DOMAIN = re.compile(r'domain[ -]name[ \t]+([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)')
+_DOMAIN = re.compile(r'domain[ -](?:name|list)[ \t]+'
+                     r'([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)')
 _FQDN_ID = re.compile(r'(?:Device ID|System Name):[ \t]*[A-Za-z0-9_-]+\.'
                       r'([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)')
 _SNMP_INFO = re.compile(r'snmp-server[ \t]+(location|contact)[ \t]+([^\r\n]+)')
