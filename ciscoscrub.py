@@ -1241,6 +1241,181 @@ def _words(text):
     return [w for w in re.split(r'[\s,]+', text) if w]
 
 
+# Windows 11-style light palette.
+UI = {
+    'bg': '#f3f3f3', 'field': '#ffffff', 'border': '#e0e0e0',
+    'border2': '#c9c9c9', 'text': '#1b1b1b', 'muted': '#616161',
+    'disabled': '#a0a0a0', 'accent': '#005fb8', 'accent_hover': '#196ebf',
+    'accent_press': '#004c94', 'hover': '#f6f6f6', 'press': '#ececec',
+    'select': '#d6e8f8', 'thumb': '#c2c2c2', 'thumb_hover': '#9e9e9e',
+    'hit': '#fff1c2',
+}
+
+
+def _apply_theme(root):
+    """Restyle ttk ('clam' base) to look like a Windows 11 app.
+
+    Returns the fonts used. Standard library only: no theme packages.
+    """
+    c = UI
+    fam = set(tkfont.families(root))
+    pick = lambda *names: next((n for n in names if n in fam), 'TkDefaultFont')
+    body = pick('Segoe UI Variable Text', 'Segoe UI')
+    semi = pick('Segoe UI Variable Text Semibold', 'Segoe UI Semibold', body)
+    disp = pick('Segoe UI Variable Display Semib', 'Segoe UI Semibold', body)
+    fonts = {'body': (body, 10), 'semi': (semi, 10), 'title': (disp, 17),
+             'mono': (pick('Cascadia Mono', 'Consolas', 'Courier New'), 10)}
+    for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont',
+                 'TkHeadingFont', 'TkCaptionFont'):
+        tkfont.nametofont(name).configure(family=body, size=10)
+    line = tkfont.nametofont('TkDefaultFont').metrics('linespace')
+    pad = max(4, int(line * 0.3))
+
+    root.configure(background=c['bg'])
+    for cls, extra in (('Listbox', {'font': fonts['body']}),
+                       ('Text', {'font': fonts['mono'], 'padX': 8,
+                                 'padY': 6, 'insertBackground': c['text']})):
+        opts = {'background': c['field'], 'foreground': c['text'],
+                'relief': 'flat', 'borderWidth': 0,
+                'highlightThickness': 1, 'highlightBackground': c['border2'],
+                'highlightColor': c['accent'], 'selectBackground': c['select'],
+                'selectForeground': c['text'], 'activeStyle': 'none'}
+        opts.update(extra)
+        for k, v in opts.items():
+            root.option_add('*%s.%s' % (cls, k), v)
+    root.option_add('*Toplevel.background', c['bg'])
+    root.option_add('*TCombobox*Listbox.font', fonts['body'])
+
+    s = ttk.Style(root)
+    s.theme_use('clam')
+    s.configure('.', background=c['bg'], foreground=c['text'],
+                font=fonts['body'], bordercolor=c['border2'],
+                lightcolor=c['bg'], darkcolor=c['bg'], troughcolor=c['bg'],
+                focuscolor=c['bg'], selectbackground=c['select'],
+                selectforeground=c['text'], fieldbackground=c['field'],
+                insertcolor=c['text'], arrowcolor=c['muted'])
+    s.configure('Hint.TLabel', foreground=c['muted'])
+    s.configure('Title.TLabel', font=fonts['title'])
+    s.configure('Section.TLabel', font=fonts['semi'])
+    s.configure('Status.TLabel', foreground=c['muted'])
+    s.configure('Box.TFrame', background=c['border2'])
+
+    # Buttons: white with a hairline border; accent buttons solid blue.
+    s.configure('TButton', background=c['field'], lightcolor=c['field'],
+                darkcolor=c['field'], bordercolor=c['border2'],
+                padding=(int(line * 0.9), pad), anchor='center')
+    flat = lambda states: {k: states for k in ('background', 'lightcolor',
+                                                'darkcolor')}
+    s.map('TButton', foreground=[('disabled', c['disabled'])],
+          **flat([('disabled', c['bg']), ('pressed', c['press']),
+                  ('active', c['hover'])]))
+    s.configure('Accent.TButton', foreground='#ffffff',
+                background=c['accent'], lightcolor=c['accent'],
+                darkcolor=c['accent'], bordercolor=c['accent'],
+                font=fonts['semi'])
+    s.map('Accent.TButton',
+          foreground=[('disabled', '#ffffff')],
+          bordercolor=[('disabled', '#c5c5c5')],
+          **flat([('disabled', '#c5c5c5'), ('pressed', c['accent_press']),
+                  ('active', c['accent_hover'])]))
+
+    # Entry / combobox: white fields, blue border when focused.
+    for w in ('TEntry', 'TCombobox'):
+        s.configure(w, padding=(6, pad - 1), lightcolor=c['field'],
+                    darkcolor=c['field'], background=c['field'])
+        s.map(w, bordercolor=[('focus', c['accent'])],
+              lightcolor=[('focus', c['field'])])
+    s.map('TCombobox', fieldbackground=[('readonly', c['field'])],
+          selectbackground=[('readonly', c['field'])],
+          selectforeground=[('readonly', c['text'])],
+          background=[('active', c['hover'])])
+
+    s.configure('TCombobox', arrowsize=max(12, int(line * 0.75)))
+    # Check and radio buttons: blue when on.
+    for w in ('TCheckbutton', 'TRadiobutton'):
+        s.configure(w, indicatorsize=max(13, int(line * 0.7)),
+                    indicatormargin=(0, 0, int(line * 0.35), 0),
+                    indicatorbackground=c['field'],
+                    indicatorforeground=c['field'],
+                    upperbordercolor=c['border2'],
+                    lowerbordercolor=c['border2'], padding=(2, 2))
+        s.map(w, background=[('active', c['bg'])],
+              indicatorbackground=[('selected', c['accent']),
+                                   ('pressed', c['press'])],
+              upperbordercolor=[('selected', c['accent'])],
+              lowerbordercolor=[('selected', c['accent'])])
+
+    # Tabs: flat; the selected one is white with bold text.
+    s.configure('TNotebook', borderwidth=0, tabmargins=(0, 0, 0, 0),
+                bordercolor=c['border'])
+    s.configure('TNotebook.Tab', background=c['bg'], lightcolor=c['bg'],
+                bordercolor=c['bg'], foreground=c['muted'],
+                padding=(int(line * 1.1), pad))
+    s.map('TNotebook.Tab',
+          background=[('selected', c['field']), ('active', c['hover'])],
+          lightcolor=[('selected', c['accent'])],
+          bordercolor=[('selected', c['border'])],
+          foreground=[('selected', c['text'])],
+          font=[('selected', fonts['semi'])])
+    s.configure('Card.TFrame', background=c['field'])
+    s.configure('Card.TLabel', background=c['field'])
+    s.configure('CardHint.TLabel', background=c['field'],
+                foreground=c['muted'])
+    s.configure('Card.TCheckbutton', background=c['field'])
+    s.map('Card.TCheckbutton', background=[('active', c['field'])])
+
+    # Tables.
+    s.configure('Treeview', background=c['field'], fieldbackground=c['field'],
+                bordercolor=c['field'], lightcolor=c['field'],
+                darkcolor=c['field'], rowheight=int(line * 1.7),
+                borderwidth=0)
+    s.map('Treeview', background=[('selected', c['select'])],
+          foreground=[('selected', c['text'])])
+    s.configure('Treeview.Heading', background=c['field'],
+                foreground=c['muted'], font=fonts['semi'], relief='flat',
+                bordercolor=c['field'], lightcolor=c['field'],
+                darkcolor=c['field'], padding=(6, pad))
+    s.map('Treeview.Heading', background=[('active', c['hover'])])
+    s.layout('Treeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+
+    # Slim scrollbars without arrows.
+    for o in ('Vertical', 'Horizontal'):
+        s.layout('%s.TScrollbar' % o, [('%s.Scrollbar.trough' % o, {
+            'sticky': 'ns' if o == 'Vertical' else 'we', 'children': [
+                ('%s.Scrollbar.thumb' % o,
+                 {'expand': '1', 'sticky': 'nswe'})]})])
+        s.configure('%s.TScrollbar' % o, troughcolor=c['field'],
+                    background=c['thumb'], bordercolor=c['field'],
+                    lightcolor=c['thumb'], darkcolor=c['thumb'],
+                    arrowsize=max(8, int(line * 0.45)), gripcount=0)
+        s.map('%s.TScrollbar' % o,
+              background=[('active', c['thumb_hover'])],
+              lightcolor=[('active', c['thumb_hover'])],
+              darkcolor=[('active', c['thumb_hover'])])
+
+    s.configure('Horizontal.TProgressbar', background=c['accent'],
+                troughcolor=c['border'], bordercolor=c['border'],
+                lightcolor=c['accent'], darkcolor=c['accent'],
+                thickness=max(4, int(line * 0.3)))
+    s.configure('TLabelframe', bordercolor=c['border'], relief='solid',
+                borderwidth=1)
+    s.configure('TLabelframe.Label', font=fonts['semi'])
+    s.configure('Sash', sashthickness=max(6, int(line * 0.4)),
+                gripcount=0, background=c['bg'])
+
+    try:                              # title bar the same colour (Windows 11)
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        rgb = int(c['bg'][1:], 16)
+        bgr = ctypes.c_int(((rgb & 0xff) << 16) | (rgb & 0xff00)
+                           | (rgb >> 16))
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 35, ctypes.byref(bgr), ctypes.sizeof(bgr))
+    except Exception:
+        pass
+    return fonts
+
+
 class App(object):
     """tkinter front end. Rules are saved to the rules file on each change."""
 
@@ -1270,11 +1445,9 @@ class App(object):
         root.minsize(int(min(900 * scale, sw * 0.8)),
                      int(min(600 * scale, sh * 0.7)))
         root.protocol('WM_DELETE_WINDOW', self._close)
-        self.mono = ('Consolas', 9)
-        line = tkfont.nametofont('TkDefaultFont').metrics('linespace')
-        style = ttk.Style(root)
-        style.configure('Treeview', rowheight=int(line * 1.35))
-        style.configure('TNotebook.Tab', padding=(int(line * 0.7), 3))
+        self.scale = scale
+        self.fonts = _apply_theme(root)
+        self.mono = self.fonts['mono']
         self._build()
         self._load_removals()
         self._refresh_rules()
@@ -1283,43 +1456,61 @@ class App(object):
     # ------------------------------------------------------------ layout
 
     def _tree(self, parent, cols, height=5, show='headings'):
-        f = ttk.Frame(parent)
-        t = ttk.Treeview(f, columns=[c[0] for c in cols], show=show,
+        """Treeview + slim scrollbar inside a 1-px border."""
+        f = ttk.Frame(parent, style='Box.TFrame', padding=1)
+        inner = ttk.Frame(f, style='Card.TFrame')
+        inner.pack(fill='both', expand=True)
+        t = ttk.Treeview(inner, columns=[c[0] for c in cols], show=show,
                          height=height)
         for cid, head, width in cols:
             t.heading(cid, text=head, anchor='w')
-            t.column(cid, width=width, stretch=width >= 150, anchor='w')
-        sb = ttk.Scrollbar(f, command=t.yview)
+            t.column(cid, width=int(width * self.scale), stretch=width >= 150,
+                     anchor='w')
+        sb = ttk.Scrollbar(inner, command=t.yview)
         t.configure(yscrollcommand=sb.set)
         t.pack(side='left', fill='both', expand=True)
-        sb.pack(side='left', fill='y')
+        sb.pack(side='left', fill='y', padx=(0, 2), pady=2)
         return f, t
 
     def _build(self):
         r = self.root
-        top = ttk.LabelFrame(r, text='Inputs (.txt / .log files or folders)')
-        top.pack(fill='x', padx=8, pady=(8, 4))
-        lf = ttk.Frame(top)
-        lf.pack(side='left', fill='both', expand=True, padx=4, pady=4)
-        self.inputs = tk.Listbox(lf, height=4, selectmode='extended')
-        sb = ttk.Scrollbar(lf, command=self.inputs.yview)
-        self.inputs.config(yscrollcommand=sb.set)
-        self.inputs.pack(side='left', fill='both', expand=True)
-        sb.pack(side='left', fill='y')
+        px = 16
+        head = ttk.Frame(r)
+        head.pack(fill='x', padx=px, pady=(12, 6))
+        ttk.Label(head, text='CiscoScrub', style='Title.TLabel').pack(
+            side='left')
+        ttk.Label(head, style='Hint.TLabel', text=(
+            '   Sanitize Cisco show output for support cases')).pack(
+            side='left', pady=(6, 0))
+        ttk.Label(head, text='v' + VERSION, style='Hint.TLabel').pack(
+            side='right', pady=(6, 0))
+
+        top = ttk.Frame(r)
+        top.pack(fill='x', padx=px, pady=(0, 6))
+        cap = ttk.Frame(top)
+        cap.grid(row=0, column=0, sticky='w')
+        ttk.Label(cap, text='Inputs', style='Section.TLabel').pack(side='left')
+        ttk.Label(cap, text='  .txt / .log files or folders',
+                  style='Hint.TLabel').pack(side='left')
+        self.inputs = tk.Listbox(top, height=3, selectmode='extended')
+        self.inputs.grid(row=1, column=0, sticky='nsew', pady=(4, 0))
         bf = ttk.Frame(top)
-        bf.pack(side='left', padx=4, pady=4)
-        for text, cmd in (('Add files...', self._add_files),
-                          ('Add folder...', self._add_folder),
-                          ('Remove', self._remove_inputs),
-                          ('Clear', lambda: self.inputs.delete(0, 'end'))):
-            ttk.Button(bf, text=text, command=cmd, width=14).pack(fill='x',
-                                                                 pady=1)
+        bf.grid(row=1, column=1, sticky='n', padx=(8, 0), pady=(4, 0))
+        for i, (text, cmd) in enumerate((
+                ('Add files...', self._add_files),
+                ('Add folder...', self._add_folder),
+                ('Remove', self._remove_inputs),
+                ('Clear', lambda: self.inputs.delete(0, 'end')))):
+            ttk.Button(bf, text=text, command=cmd, width=12).grid(
+                row=i // 2, column=i % 2, sticky='ew', padx=(0, 4), pady=(0, 4))
         self.v_sub = tk.BooleanVar(value=self.cfg['include_subfolders'])
         ttk.Checkbutton(bf, text='Include subfolders',
-                        variable=self.v_sub).pack(anchor='w')
+                        variable=self.v_sub).grid(row=2, column=0,
+                                                  columnspan=2, sticky='w')
+        top.columnconfigure(0, weight=1)
 
         paths = ttk.Frame(r)
-        paths.pack(fill='x', padx=8)
+        paths.pack(fill='x', padx=px, pady=(0, 4))
         self.v_out, self.v_rep = tk.StringVar(), tk.StringVar()
         for row, (label, var, cmd, hint) in enumerate((
                 ('Output folder', self.v_out, self._pick_out,
@@ -1327,12 +1518,12 @@ class App(object):
                 ('Report file', self.v_rep, self._pick_rep,
                  'blank = next to the output folder'))):
             ttk.Label(paths, text=label).grid(row=row, column=0, sticky='w',
-                                              padx=(0, 6))
+                                              padx=(0, 10))
             ttk.Entry(paths, textvariable=var).grid(row=row, column=1,
-                                                    sticky='ew', pady=1)
+                                                    sticky='ew', pady=2)
             ttk.Button(paths, text='Browse...', command=cmd).grid(
-                row=row, column=2, padx=4)
-            ttk.Label(paths, text=hint, foreground='gray').grid(
+                row=row, column=2, padx=(8, 8))
+            ttk.Label(paths, text=hint, style='Hint.TLabel').grid(
                 row=row, column=3, sticky='w')
         paths.columnconfigure(1, weight=1)
 
@@ -1340,15 +1531,17 @@ class App(object):
         # their space when the window is small.
         self.v_status = tk.StringVar(value='Ready. Add inputs, then Scan '
                                            'to get rule suggestions.')
-        ttk.Label(r, textvariable=self.v_status, anchor='w').pack(
-            side='bottom', fill='x', padx=8, pady=(2, 6))
+        ttk.Label(r, textvariable=self.v_status, anchor='w',
+                  style='Status.TLabel').pack(side='bottom', fill='x',
+                                              padx=px, pady=(4, 10))
         bottom = ttk.Frame(r)
-        bottom.pack(side='bottom', fill='x', padx=8)
-        self.b_scrub = ttk.Button(bottom, text='Scrub', command=self._scrub)
+        bottom.pack(side='bottom', fill='x', padx=px, pady=(6, 0))
+        self.b_scrub = ttk.Button(bottom, text='Scrub', width=12,
+                                  style='Accent.TButton', command=self._scrub)
         self.b_scrub.pack(side='left')
         self.b_cancel = ttk.Button(bottom, text='Cancel', state='disabled',
                                    command=self._cancel)
-        self.b_cancel.pack(side='left', padx=4)
+        self.b_cancel.pack(side='left', padx=8)
         self.b_open = ttk.Button(bottom, text='Open output folder',
                                  state='disabled', command=self._open_out)
         self.b_open.pack(side='right')
@@ -1356,7 +1549,7 @@ class App(object):
         self.pb.pack(side='left', fill='x', expand=True, padx=8)
 
         self.nb = ttk.Notebook(r)
-        self.nb.pack(fill='both', expand=True, padx=8, pady=4)
+        self.nb.pack(fill='both', expand=True, padx=px, pady=(8, 0))
         self._build_scan()
         self._build_rules()
         self._build_removals()
@@ -1364,11 +1557,12 @@ class App(object):
         self._build_log()
 
     def _build_scan(self):
-        tab = ttk.Frame(self.nb, padding=4)
+        tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
         self.nb.add(tab, text='Scan')
         bar = ttk.Frame(tab)
         bar.pack(fill='x', pady=(0, 4))
-        self.b_scan = ttk.Button(bar, text='Scan inputs', command=self._scan)
+        self.b_scan = ttk.Button(bar, text='Scan inputs', command=self._scan,
+                                 style='Accent.TButton')
         self.b_scan.pack(side='left')
         ttk.Button(bar, text='Import node list...',
                    command=self._import_nodes).pack(side='left', padx=(4, 0))
@@ -1378,11 +1572,11 @@ class App(object):
         ttk.Checkbutton(bar, variable=self.v_quick,
                         text='Quick (first %d MB of each file)'
                         % self.cfg['quick_scan_mb']).pack(side='left', padx=8)
-        ttk.Button(bar, text='Add checked to rules',
+        ttk.Button(bar, text='Add checked to rules', style='Accent.TButton',
                    command=self._add_checked).pack(side='right')
         ttk.Button(bar, text='Suggest "To" values',
                    command=self._suggest).pack(side='right', padx=4)
-        ttk.Label(tab, foreground='gray', text=(
+        ttk.Label(tab, style='Hint.TLabel', text=(
             'Click a box to check a row. Double-click From (hostnames) or To '
             'to edit. Secrets and known accounts are already handled by the '
             'Removals tab.')).pack(anchor='w', pady=(0, 4))
@@ -1396,7 +1590,7 @@ class App(object):
         self.st.bind('<Double-1>', self._scan_edit)
 
     def _build_rules(self):
-        tab = ttk.Frame(self.nb, padding=4)
+        tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
         self.nb.add(tab, text='Rules')
         bar = ttk.Frame(tab)
         bar.pack(fill='x', pady=(0, 4))
@@ -1406,7 +1600,7 @@ class App(object):
                           ('Enable / disable', self._rule_toggle)):
             ttk.Button(bar, text=text, command=cmd).pack(side='left',
                                                          padx=(0, 4))
-        ttk.Label(bar, foreground='gray', text=(
+        ttk.Label(bar, style='Hint.TLabel', text=(
             'Remaps. Saved to %s on every change.'
             % os.path.basename(self.rules_path))).pack(side='left', padx=8)
         f, self.rt = self._tree(tab, (
@@ -1416,7 +1610,7 @@ class App(object):
         self.rt.bind('<Double-1>', lambda e: self._rule_edit())
 
     def _build_removals(self):
-        tab = ttk.Frame(self.nb, padding=4)
+        tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
         self.nb.add(tab, text='Removals')
         left = ttk.LabelFrame(tab, text='Built-in rules (click On to toggle)')
         left.pack(side='left', fill='both', expand=True, padx=(0, 4))
@@ -1444,13 +1638,20 @@ class App(object):
         right.pack(side='left', fill='both', expand=True, padx=(4, 0))
         inner = ttk.Frame(right, padding=4)
         inner.pack(fill='both', expand=True)
-        ttk.Label(inner, text='Manual account list (one per line):').pack(
-            anchor='w')
-        ttk.Label(inner, foreground='gray', text=(
-            'john.doe = exact.  adm.  or  adm.*  = every adm.<name>.  '
-            'adm* = anything starting adm.')).pack(anchor='w')
-        self.t_manual = tk.Text(inner, height=5, width=36, font=self.mono)
-        self.t_manual.pack(fill='x')
+        row = ttk.Frame(inner)
+        row.pack(fill='x')
+        ttk.Label(row, text='Manual account list (one per line):').pack(
+            side='left')
+        ttk.Button(row, text='Save', style='Accent.TButton',
+                   command=self._save_removals).pack(side='right')
+        ttk.Label(inner, style='Hint.TLabel',
+                  wraplength=int(340 * self.scale), text=(
+                      'john.doe = exact.   adm.  or  adm.*  = every '
+                      'adm.<name>.   adm* = anything starting adm.')).pack(
+            anchor='w', pady=(2, 2))
+        # Text boxes expand and shrink together so everything fits.
+        self.t_manual = tk.Text(inner, height=2, width=36, font=self.mono)
+        self.t_manual.pack(fill='both', expand=True)
         self.v_learn, self.v_mask = tk.BooleanVar(), tk.BooleanVar()
         self.v_detail, self.v_reshost = tk.BooleanVar(), tk.BooleanVar()
         for text, var in (
@@ -1468,51 +1669,52 @@ class App(object):
         ttk.Combobox(grid, textvariable=self.v_sweep, width=10,
                      values=('list', 'replace', 'off'),
                      state='readonly').grid(row=0, column=1, sticky='w')
-        ttk.Label(grid, text='Placeholder').grid(row=1, column=0, sticky='w')
-        ttk.Entry(grid, textvariable=self.v_ph, width=14).grid(
-            row=1, column=1, sticky='w')
-        ttk.Label(grid, text='File types').grid(row=2, column=0, sticky='w')
-        ttk.Entry(grid, textvariable=self.v_ext, width=14).grid(
-            row=2, column=1, sticky='w')
-        ttk.Label(inner, text='Never learned as accounts:').pack(anchor='w')
-        self.t_common = tk.Text(inner, height=3, width=36, font=self.mono,
+        ttk.Label(grid, text='Placeholder').grid(row=1, column=0, sticky='w',
+                                                 pady=(4, 0))
+        ph = ttk.Frame(grid)
+        ph.grid(row=1, column=1, sticky='w', pady=(4, 0))
+        ttk.Entry(ph, textvariable=self.v_ph, width=12).pack(side='left')
+        ttk.Label(ph, text='   File types ').pack(side='left')
+        ttk.Entry(ph, textvariable=self.v_ext, width=9).pack(side='left')
+        ttk.Label(inner, text='Never learned as accounts:').pack(
+            anchor='w', pady=(4, 0))
+        self.t_common = tk.Text(inner, height=2, width=36, font=self.mono,
                                 wrap='word')
-        self.t_common.pack(fill='x')
+        self.t_common.pack(fill='both', expand=True)
         ttk.Label(inner, text='Not possible accounts (endings, extensions):'
-                  ).pack(anchor='w')
-        self.t_sweepex = tk.Text(inner, height=3, width=36, font=self.mono,
+                  ).pack(anchor='w', pady=(4, 0))
+        self.t_sweepex = tk.Text(inner, height=2, width=36, font=self.mono,
                                  wrap='word')
-        self.t_sweepex.pack(fill='x')
-        ttk.Button(inner, text='Save', command=self._save_removals).pack(
-            anchor='e', pady=4)
+        self.t_sweepex.pack(fill='both', expand=True)
 
     def _build_test(self):
-        tab = ttk.Frame(self.nb, padding=4)
+        tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
         self.nb.add(tab, text='Test')
         bar = ttk.Frame(tab)
         bar.pack(fill='x', pady=(0, 4))
         ttk.Button(bar, text='Test', command=self._test).pack(side='left')
-        ttk.Label(bar, foreground='gray', text=(
+        ttk.Label(bar, style='Hint.TLabel', text=(
             'Paste sample lines on the left; the result updates as you type. '
             'Uses the current rules.')).pack(side='left', padx=8)
+        # The hits list is packed first so the text panes can't squeeze it.
+        f, self.ht = self._tree(tab, (('line', 'Line', 50),
+                                      ('rule', 'Rule', 230),
+                                      ('before', 'Before', 280),
+                                      ('after', 'After', 280)), height=6)
+        f.pack(side='bottom', fill='x', pady=(8, 0))
         pw = ttk.PanedWindow(tab, orient='horizontal')
         pw.pack(fill='both', expand=True)
         self.t_in = tk.Text(pw, font=self.mono, wrap='none', undo=True)
         self.t_out = tk.Text(pw, font=self.mono, wrap='none',
                              state='disabled')
-        self.t_out.tag_configure('hit', background='#fff0a0')
+        self.t_out.tag_configure('hit', background=UI['hit'])
         pw.add(self.t_in, weight=1)
         pw.add(self.t_out, weight=1)
-        f, self.ht = self._tree(tab, (('line', 'Line', 50),
-                                      ('rule', 'Rule', 230),
-                                      ('before', 'Before', 280),
-                                      ('after', 'After', 280)), height=7)
-        f.pack(fill='x', pady=(4, 0))
         self.t_in.bind('<KeyRelease>', self._test_soon)
         self.t_in.bind('<<Paste>>', self._test_soon)
 
     def _build_log(self):
-        tab = ttk.Frame(self.nb, padding=4)
+        tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
         self.nb.add(tab, text='Log')
         self.t_log = tk.Text(tab, font=self.mono, state='disabled', wrap='none')
         sb = ttk.Scrollbar(tab, command=self.t_log.yview)
@@ -1619,7 +1821,7 @@ class App(object):
                         variable=v_what).grid(row=2, column=0, sticky='w')
         ttk.Radiobutton(frm, text='Remove the rest of the line', value='line',
                         variable=v_what).grid(row=2, column=1, sticky='w')
-        ttk.Label(frm, foreground='gray', text=(
+        ttk.Label(frm, style='Hint.TLabel', text=(
             'A single-digit encryption type after the keyword is kept '
             '(key 7 <REMOVED>).')).grid(row=3, column=0, columnspan=2,
                                         sticky='w', pady=4)
@@ -1705,7 +1907,7 @@ class App(object):
         c_word = ttk.Checkbutton(opts, text='Whole word', variable=v_word)
         c_case = ttk.Checkbutton(opts, text='Match case', variable=v_case)
         ttk.Checkbutton(opts, text='Enabled', variable=v_on).pack(side='right')
-        ttk.Label(frm, textvariable=v_hint, foreground='gray').grid(
+        ttk.Label(frm, textvariable=v_hint, style='Hint.TLabel').grid(
             row=4, column=0, columnspan=2, sticky='w', pady=4)
 
         def on_kind(*_):
