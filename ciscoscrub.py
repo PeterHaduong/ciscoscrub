@@ -121,9 +121,13 @@ def _ciw(word):
 _T = r'(?:\d{1,2}[ \t]+)?'                       # encryption type: "7 ", "9 "
 _V = r'(?P<v>"[^"\r\n]*"|\S+)'                     # secret value
 _A = r'(?P<v>[^\s,;:\'"()\[\]@]+)'                 # account name
+_L = r'(?P<v>[^\r\n]*[^\s])'                       # rest of the line
 
-# (id, kind, literal hints or None, pattern(s), at line start). A rule runs on
-# a chunk only if one of its hints occurs in it. Secrets run before accounts.
+# (id, kind, literal hints or None, pattern(s), at line start[, mode]).
+# kind: secret (masked in the report), private, or account (learned).
+# mode: None, 'email', 'dn', 'block' or 'notmac' (see Scrubber._removal).
+# A rule runs on a chunk only if one of its hints occurs in it. Order matters:
+# secrets, then private details, then accounts.
 BUILTIN_RULES = [
     ('password', 'secret', ('password',),
      _w('password') + r'[ \t]+' + _T + _V, False),
@@ -176,8 +180,47 @@ BUILTIN_RULES = [
      r'wpa-psk[ \t]+(?:ascii|hex)[ \t]+' + _T + _V, False),
     ('config-key', 'secret', ('config-key',),
      r'config-key[ \t]+password-encrypt[ \t]+' + _V, False),
+    ('x-password', 'secret', ('-password ',),
+     r'[A-Za-z]-password[ 	]+' + _T + _V, False),
+    ('url credentials', 'secret', ('://',),
+     r'://(?P<v>[^\s/@]+)@', False),
+    ('server-key', 'secret', ('server-key',),
+     _w('server-key') + r'[ \t]+' + _T + _V, False),
+    ('wlc set-key', 'secret', ('set-key',),
+     r'set-key[ \t]+(?:ascii|hex)[ \t]+' + _T + _V, False),
+    ('nhrp authentication', 'secret', ('nhrp',),
+     r'nhrp[ \t]+authentication[ \t]+' + _V, False),
+    ('license idtoken', 'secret', ('idtoken',),
+     r'idtoken[ \t]+' + _V, False),
+    ('call-home contact', 'private',
+     ('contact-email-addr', 'phone-number', 'street-address', 'customer-id',
+      'site-id', 'contract-id'),
+     r'(?:contact-email-addr|phone-number|street-address|customer-id|site-id'
+     r'|contract-id)[ \t]+' + _L, True),
+    ('smart account', 'private', (' Account',),
+     r'(?:Smart|Virtual)[ \t]+Account(?:[ \t]+Name)?[ \t]*:[ \t]*' + _L,
+     False),
+    ('snmp location / contact', 'private', ('snmp-server ',),
+     r'snmp-server[ \t]+(?:location|contact)[ \t]+' + _L, False),
+    ('lldp-med location', 'private', ('-location',),
+     r'location[ \t]+(?:civic|geo)-location[ \t]+identifier[^\n]*\n'
+     r'(?P<v>(?:[ \t]+[^\n]*\n)+)', True, 'block'),
+    ('certificate / ldap names', 'private',
+     ('cn=', 'CN=', 'ou=', 'OU=', 'dc=', 'DC='),
+     r'(?:[Cc][Nn]|[Oo][Uu]?|[Dd][Cc]|[Ll]|[Ss][Tt]|[Cc]|[Ee][Aa]?'
+     r'|[Uu][Ii][Dd])=(?P<v>[^,+\r\n"]*[^,+\s"])', False, 'dn'),
+    ('email address', 'private', ('@',),
+     r'@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![\w-])', False,
+     'email'),
     ('username', 'account', ('username',),
      r'username[ \t]+' + _A, True),
+    ('ip ftp / http username', 'account', ('username',),
+     r'ip[ \t]+(?:ftp|http[ \t]+client)[ \t]+username[ \t]+' + _A, False),
+    ('user@line', 'account', ('@vty', '@tty', '@con', '@aux'),
+     r'(?P<v>[A-Za-z0-9_.\\-]+)@(?:vty|tty|console|con|aux)\d', False),
+    ('802.1x user-name', 'account', ('ser-', 'SER-'),
+     r'[Uu][Ss][Ee][Rr]-[Nn][Aa][Mm][Ee][ \t]*[:=][ \t]*'
+     r'(?P<v>[^\s,;\'"()\[\]]+)', False, 'notmac'),
     ('snmp user', 'account', ('snmp-server user',),
      r'snmp-server[ \t]+user[ \t]+' + _A, False),
     ('sent-username', 'account', ('sent-username',),
@@ -200,6 +243,13 @@ NONSECRET = {
 }
 # Context matches that are not accounts.
 NONACCOUNT = {'console', 'unknown', 'none', 'system', 'n/a'}
+
+# MAB logins use the MAC as the user name; those are left alone.
+_MAC = re.compile(r'^(?:[0-9A-Fa-f]{2}[-:]?){5}[0-9A-Fa-f]{2}$'
+                  r'|^[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}$')
+# A line is a certificate / LDAP name only if it has one of these.
+_DN_STRONG = re.compile(r'(?<![\w-])(?:[Cc][Nn]|[Oo][Uu]|[Dd][Cc])=')
+EMAIL_LOCAL = frozenset(string.ascii_letters + string.digits + '._%+-')
 
 LETTERS = frozenset(string.ascii_letters)
 WORDISH = frozenset(string.ascii_letters + string.digits + '_')
@@ -336,6 +386,31 @@ def _token(s, i, j):
     return s[i:j]
 
 
+class _OrigMatch(object):
+    """A match found in lowercased text, read back from the original."""
+    __slots__ = ('m', 'string')
+
+    def __init__(self, m, text):
+        self.m, self.string = m, text
+
+    def start(self, g=0):
+        return self.m.start(g)
+
+    def end(self, g=0):
+        return self.m.end(g)
+
+    def span(self, g=0):
+        return self.m.span(g)
+
+    def group(self, g=0):
+        a, b = self.m.span(g)
+        return None if a < 0 else self.string[a:b]
+
+    @property
+    def lastgroup(self):
+        return self.m.lastgroup
+
+
 class _Lines(object):
     """Line numbers for match positions, counted incrementally."""
 
@@ -442,12 +517,16 @@ class Scrubber(object):
         cfg, prof = self.cfg, self.prof
         off = set(cfg['disabled_builtins'])
         self.removals = []
-        for rid, kind, hints, pats, bol in BUILTIN_RULES:
+        prefix = {'secret': 'Secret: ', 'private': 'Removed: ',
+                  'account': 'Account: '}
+        for entry in BUILTIN_RULES:
+            rid, kind, hints, pats, bol = entry[:5]
+            mode = entry[5] if len(entry) > 5 else None
             if rid in off:
                 continue
-            label = ('Secret: ' if kind == 'secret' else 'Account: ') + rid
             for pat in (pats if isinstance(pats, tuple) else (pats,)):
-                self.removals.append((label, kind, hints, re.compile(pat), bol))
+                self.removals.append((prefix[kind] + rid, kind, hints,
+                                      re.compile(pat), bol, mode))
         for r in cfg['custom_removals']:
             words = r.get('keyword', '').split()
             if not r.get('on', True) or not words:
@@ -457,7 +536,7 @@ class Scrubber(object):
                                           for w in words[1:])
                    + r'[ \t]+' + _T + val)
             self.removals.append(('Custom: ' + ' '.join(words), 'secret',
-                                  (words[0],), re.compile(pat), False))
+                                  (words[0],), re.compile(pat), False, None))
         self.account_rules = [x for x in self.removals if x[1] == 'account']
         self.common = {w.lower() for w in cfg['common_words']}
         self.sweep_ex = {w.lower() for w in cfg['sweep_exclude']}
@@ -467,12 +546,18 @@ class Scrubber(object):
         # IPv4: "a.b" -> "c.d"
         self.v4 = {parse_v4_prefix(r['from']): parse_v4_prefix(r['to'])
                    for r in on('ipv4')}
-        self.v4_rx = self.res4 = self.col4 = None
+        self.v4_rx = self.res4 = self.col4 = self.hex4 = None
         if self.v4:
             alts = '|'.join(re.escape(p) for p in self.v4)
             self.v4_rx = re.compile('(' + alts + r')\.(\d{1,3})\.(\d{1,3})'
                                     r'(?!\d|\.\d)')
             self.res4 = re.compile('(?:' + alts + r')\.\d')
+            # The same prefix in hex (packet dumps, debugs): 192.168 = c0a8,
+            # seen as C0A80A01, 0xc0a80a01 or "c0a8 0a01".
+            hx = ['%02x%02x' % tuple(int(o) for o in p.split('.'))
+                  for p in self.v4]
+            self.hex4 = re.compile('(?:' + '|'.join(hx)          # lowercase
+                                   + r') ?[0-9a-f]{4}(?![0-9a-f])')
             tos = set(self.v4.values()) - set(self.v4)
             if tos:
                 self.col4 = re.compile('(?:' + '|'.join(
@@ -482,12 +567,17 @@ class Scrubber(object):
         # IPv6: top 32 bits -> top 32 bits
         self.v6 = {parse_v6_prefix(r['from']): parse_v6_prefix(r['to'])
                    for r in on('ipv6')}
-        self.v6_rx = self.res6 = self.col6 = None
+        self.v6_rx = self.res6 = self.col6 = self.hex6 = None
         if self.v6:
             firsts = sorted({k >> 16 for k in self.v6})
-            self.v6_rx = re.compile('(?:' + '|'.join(_hextet(h) for h in firsts)
-                                    + r')(?=:)[0-9A-Fa-f:.]*')
+            # Searched in the lowercased text (see _apply).
+            self.v6_rx = re.compile('(?:' + '|'.join(
+                '0' * z + '%x' % h for h in firsts
+                for z in range(5 - len('%x' % h))) + r')(?=:)[0-9a-f:.]*')
             self.res6 = re.compile(_v6_prefix_rx(self.v6))
+            self.hex6 = re.compile('(?:' + '|'.join(
+                '%04x ?%04x' % (k >> 16, k & 0xffff) for k in self.v6)
+                + r')(?![0-9a-f])')
             tos = set(self.v6.values()) - set(self.v6)
             if tos:
                 self.col6 = re.compile(_v6_prefix_rx(tos))
@@ -497,11 +587,11 @@ class Scrubber(object):
         self.hr = {r['from'].upper(): r['to'] for r in on('host_role')}
         self.h_rx = None
         if self.hp:
-            alts = '|'.join(_ci(p) for p in
+            alts = '|'.join(re.escape(p.lower()) for p in
                             sorted(self.hp, key=len, reverse=True))
-            self.h_rx = re.compile('(?P<pre>' + alts
-                                   + r')(?P<rest>(?:[-_][A-Za-z0-9]+)*)'
-                                   r'(?![A-Za-z0-9])')
+            self.h_rx = re.compile('(?P<pre>' + alts       # lowercased text
+                                   + r')(?P<rest>(?:[-_][a-z0-9]+)*)'
+                                   r'(?![a-z0-9])')
         self.h_tos = tuple(t.upper() for t in self.hp.values())
 
         # Text: one alternation so replacements never chain
@@ -511,13 +601,24 @@ class Scrubber(object):
             alts = []
             order = sorted(range(len(self.text)),
                            key=lambda i: -len(self.text[i]['from']))
+            # All ignore-case (the usual case): search the lowercased text
+            # with plain literals and no groups (named groups make the scan
+            # ~20x slower); the rule is looked up from the matched text.
+            # Any match-case rule: one pattern with a named group per rule.
+            self.text_low = not any(r.get('case', False) for r in self.text)
+            self.text_map = {}
             for i in order:
                 r = self.text[i]
-                p = (re.escape(r['from']) if r.get('case', False)
-                     else _ci(r['from']))
+                if self.text_low:
+                    p = re.escape(r['from'].lower())
+                    self.text_map.setdefault(r['from'].lower(), i)
+                elif r.get('case', False):
+                    p = re.escape(r['from'])
+                else:
+                    p = _ci(r['from'])
                 if r.get('word', True):
                     p += r'(?![A-Za-z0-9])'
-                alts.append('(?P<t%d>%s)' % (i, p))
+                alts.append(p if self.text_low else '(?P<t%d>%s)' % (i, p))
             self.text_rx = re.compile('|'.join(alts))
 
         self.regex = [(re.compile(r['pattern'], re.M), r['replace'],
@@ -541,26 +642,36 @@ class Scrubber(object):
             elif n:
                 exact.add(n)
         self.exact_accounts = {n.lower() for n in exact}
-        alts = [_ci(n) for n in sorted(exact, key=len, reverse=True)]
+        alts = [re.escape(n) for n in sorted(self.exact_accounts, key=len,
+                                             reverse=True)]
         for p in sorted(prefixes, key=len, reverse=True):
             tail = r'[\w-]+(?:\.[\w-]+)*' if p.endswith('.') else r'[\w.-]*'
-            alts.append(_ci(p) + tail)
-        self.learned_rx = None
+            alts.append(re.escape(p.lower()) + tail)
+        self.learned_rx = None                 # searched in lowercased text
         if alts:
             self.learned_rx = re.compile(
                 '(?:' + '|'.join(alts) + r')(?![\w-]|\.\w)')
 
     # -- applying
 
-    def _apply(self, rx, fn, text, write=True):
+    def _apply(self, rx, fn, text, write=True, low=False):
         """Run rx over text. fn(m) returns None (skip) or
         (start, end, new, rule, before, after). Returns the new text, or
-        text unchanged when write is False (checks only)."""
+        text unchanged when write is False (checks only).
+
+        low=True: rx is written in lowercase and searched in text.lower(),
+        which is much faster than case-insensitive patterns. Lowercasing
+        keeps every position (latin-1 text), and fn still sees the original
+        text through _OrigMatch."""
         lines = _Lines(text, self.line)
         rep = self.report
         out = []
         last = 0
-        for m in rx.finditer(text):
+        if low:
+            found = (_OrigMatch(m, text) for m in rx.finditer(text.lower()))
+        else:
+            found = rx.finditer(text)
+        for m in found:
             res = fn(m)
             if res is None:
                 continue
@@ -578,8 +689,26 @@ class Scrubber(object):
         out.append(text[last:])
         return ''.join(out)
 
-    def _removal(self, label, kind, bol):
+    def _removal(self, label, kind, bol, mode=None):
+        """fn for one removal rule: replace group 'v' with the placeholder.
+
+        mode 'email': the match is '@domain'; the local part is found by
+        walking back. 'dn': only on lines that look like a certificate / LDAP
+        name (cn=, ou= or dc=). 'block': v is a block of indented lines; each
+        keeps its first word. 'notmac': skip values that are MAC addresses.
+        """
         ph, masked = self.ph, self.mask and kind == 'secret'
+        if mode == 'email':
+            def fn(m):
+                s, at = m.string, m.start()
+                i = at
+                while i > 0 and s[i - 1] in EMAIL_LOCAL:
+                    i -= 1
+                if i == at:
+                    return None
+                tok = s[i:m.end()]
+                return i, m.end(), ph, label, tok, ph
+            return fn
 
         def fn(m):
             v = m.group('v')
@@ -589,7 +718,31 @@ class Scrubber(object):
                 return None
             if bol and not _at_line_start(m.string, m.start()):
                 return None
+            if mode == 'notmac' and _MAC.match(v):
+                return None
+            if mode == 'dn':
+                s = m.string
+                p = _prev(s, m.start())
+                if p in WORDISH or p in '.-':
+                    return None
+                ls = s.rfind('\n', 0, m.start()) + 1
+                le = s.find('\n', m.start())
+                if not _DN_STRONG.search(s, ls, le if le >= 0 else len(s)):
+                    return None
             a, b = m.span('v')
+            if mode == 'block':
+                new, vals = [], []
+                for line in v.splitlines(True):
+                    body = line.rstrip('\r\n')
+                    parts = body.split(None, 1)
+                    if len(parts) == 2 and parts[1] != ph:
+                        indent = body[:len(body) - len(body.lstrip())]
+                        vals.append(parts[1])
+                        line = indent + parts[0] + ' ' + ph + line[len(body):]
+                    new.append(line)
+                if not vals:
+                    return None
+                return a, b, ''.join(new), label, ' | '.join(vals), ph
             return a, b, ph, label, mask(v) if masked else v, ph
         return fn
 
@@ -650,10 +803,13 @@ class Scrubber(object):
                 m.group(0), new)
 
     def _text(self, m):
-        r = self.text[int(m.lastgroup[1:])]
+        src = m.group(0)
+        if self.text_low:
+            r = self.text[self.text_map[src.lower()]]
+        else:
+            r = self.text[int(m.lastgroup[1:])]
         if r.get('word', True) and _prev(m.string, m.start()).isalnum():
             return None
-        src = m.group(0)
         new = r['to'] if r.get('case', False) else match_case(src, r['to'])
         return m.start(), m.end(), new, 'Text ' + r['from'], src, new
 
@@ -742,19 +898,19 @@ class Scrubber(object):
             ap(self.col6, self._check('Warning: collision IPv6',
                                       '(already in input)', True), text, False)
 
-        for label, kind, hints, rx, bol in self.removals:
+        for label, kind, hints, rx, bol, mode in self.removals:
             if hints is None or any(h in text for h in hints):
-                text = ap(rx, self._removal(label, kind, bol), text)
+                text = ap(rx, self._removal(label, kind, bol, mode), text)
         if self.learned_rx is not None:
-            text = ap(self.learned_rx, self._learned, text)
+            text = ap(self.learned_rx, self._learned, text, low=True)
         if self.h_rx is not None:
-            text = ap(self.h_rx, self._host, text)
+            text = ap(self.h_rx, self._host, text, low=True)
         if self.v6_rx is not None:
-            text = ap(self.v6_rx, self._v6, text)
+            text = ap(self.v6_rx, self._v6, text, low=True)
         if self.v4_rx is not None:
             text = ap(self.v4_rx, self._v4, text)
         if self.text_rx is not None:
-            text = ap(self.text_rx, self._text, text)
+            text = ap(self.text_rx, self._text, text, low=self.text_low)
         for rx, repl, pat in self.regex:
             text = ap(rx, self._regex(rx, repl, pat), text)
         if self.cfg['account_sweep'] in ('list', 'replace'):
@@ -768,6 +924,11 @@ class Scrubber(object):
         if self.res6 is not None:
             ap(self.res6, self._check('Residual IPv6', '(left as is)', True),
                text, False)
+        for rx, rule in ((self.hex4, 'Residual IPv4 (hex)'),
+                         (self.hex6, 'Residual IPv6 (hex)')):
+            if rx is not None:
+                ap(rx, self._check(rule, '(hex; check by hand)', True),
+                   text, False, low=True)
         if self.cfg['residual_hostnames']:
             ap(_HOST_LAST, self._host_residual, text, False)
         return text
@@ -777,10 +938,10 @@ class Scrubber(object):
     def learn_text(self, text):
         """Account names found in account contexts in text."""
         found = set()
-        for label, kind, hints, rx, bol in self.account_rules:
+        for label, kind, hints, rx, bol, mode in self.account_rules:
             if hints is not None and not any(h in text for h in hints):
                 continue
-            fn = self._removal(label, kind, bol)
+            fn = self._removal(label, kind, bol, mode)
             for m in rx.finditer(text):
                 if fn(m) is not None:
                     found.add(m.group('v'))
@@ -1142,7 +1303,9 @@ _DOMAIN = re.compile(r'domain[ -](?:name|list)[ \t]+'
                      r'([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)')
 _FQDN_ID = re.compile(r'(?:Device ID|System Name):[ \t]*[A-Za-z0-9_-]+\.'
                       r'([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)')
-_SNMP_INFO = re.compile(r'snmp-server[ \t]+(location|contact)[ \t]+([^\r\n]+)')
+# Free text to review: interface / VLAN / other descriptions and indented
+# "name X" lines (VLAN names and the like).
+_DESC = re.compile(r'(description|name)[ \t]+([^\r\n]*\S)')
 _KEYWORDS = re.compile(r'password|secret|key|community|psk|credential')
 # Keyword lines that are settings, not secrets (not suggested).
 _KW_SAFE = re.compile(
@@ -1239,7 +1402,7 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
     eng.set_learned(())
     col = _Collect()
     eng.report = col
-    v4, v6, domains, snmp, keywords = {}, {}, {}, {}, {}
+    v4, v6, domains, descs, keywords = {}, {}, {}, {}, {}
     total = sum(min(os.path.getsize(p), limit or 1 << 62) for p, _ in files)
     done = 0
     cancelled = truncated = False
@@ -1282,11 +1445,17 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
                     for rx in (_DOMAIN, _FQDN_ID):
                         for m in rx.finditer(chunk):
                             bump(domains, m.group(1).lower(), m.group(0))
-                    for m in _SNMP_INFO.finditer(chunk):
-                        bump(snmp, 'snmp-server ' + m.group(1),
-                             m.group(2).strip())
-
                     text = eng.scrub_text(chunk)
+                    # Descriptions as they will be sent (after scrubbing).
+                    for m in _DESC.finditer(text):
+                        ls = text.rfind('\n', 0, m.start()) + 1
+                        lead = text[ls:m.start()]
+                        if lead.strip(' \t') or (m.group(1) == 'name'
+                                                 and not lead):
+                            continue
+                        val = m.group(2)
+                        if val != eng.ph:
+                            bump(descs, val[:150], m.group(1))
                     low = text.lower()
                     last = -1
                     for m in _KEYWORDS.finditer(low):
@@ -1311,7 +1480,9 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
     except Cancelled:
         cancelled = True
 
-    found = {'ipv4': v4, 'ipv6': v6, 'domains': domains, 'snmp': snmp,
+    found = {'ipv4': v4, 'ipv6': v6, 'domains': domains,
+             'descs': dict(sorted(descs.items(),
+                                  key=lambda kv: -kv[1][0])[:500]),
              'hosts': {}, 'host_mapped': {}, 'accounts': {},
              'possible_accounts': {}, 'secrets': {}, 'cancelled': cancelled,
              'truncated': truncated}
@@ -1325,8 +1496,8 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
             found['accounts'][before] = [count, rule]
         elif rule.startswith('Possible account'):
             found['possible_accounts'][before] = [count, before]
-        elif rule.startswith('Secret: '):
-            s = found['secrets'].setdefault(rule[8:], [0, ''])
+        elif rule.startswith(('Secret: ', 'Removed: ')):
+            s = found['secrets'].setdefault(rule, [0, ''])
             s[0] += count
     # Names already seen in account contexts are learned on a real run.
     known = {a.lower() for a in found['accounts']}
@@ -1385,7 +1556,7 @@ def suggest_domain(n):
 
 
 def empty_found():
-    return {'ipv4': {}, 'ipv6': {}, 'domains': {}, 'snmp': {}, 'hosts': {},
+    return {'ipv4': {}, 'ipv6': {}, 'domains': {}, 'descs': {}, 'hosts': {},
             'host_mapped': {}, 'accounts': {}, 'possible_accounts': {},
             'secrets': {}, 'keywords': {}, 'cancelled': False,
             'truncated': False}
@@ -1414,18 +1585,23 @@ for _r in BUILTIN_RULES:
         BUILTIN_IDS.append(_r[0])
 BUILTIN_KIND = {r[0]: r[1] for r in BUILTIN_RULES}
 
+# (group, short title for the From column, explanation for the wide Example
+# column; the table cannot wrap text).
 SCAN_GROUPS = [
-    ('ipv4', 'IPv4 prefixes (first two octets)'),
-    ('ipv6', 'IPv6 prefixes (first two hextets)'),
-    ('host', 'Hostname prefixes (edit From to shorten to 2 blocks)'),
-    ('domain', 'Domain names'),
-    ('account', 'Possible accounts (word.word not seen as an account)'),
-    ('snmp', 'SNMP location / contact (remove rest of line)'),
-    ('keyword', 'Lines with password / key words no rule covers '
-                '(To = keyword to remove the value after)'),
-    ('info', 'Already handled'),
+    ('ipv4', 'IPv4 prefixes', 'First two octets.'),
+    ('ipv6', 'IPv6 prefixes', 'First two hextets.'),
+    ('host', 'Hostname prefixes',
+     'Double-click From to shorten a prefix to 2 blocks.'),
+    ('domain', 'Domain names', ''),
+    ('account', 'Possible accounts',
+     'word.word names not seen as an account. Checked ones are removed.'),
+    ('keyword', 'Uncovered key / password lines',
+     'To = the keyword to remove the value after.'),
+    ('desc', 'Descriptions and names',
+     'As sent. To change one word, edit From to that word.'),
+    ('info', 'Already handled', 'For information.'),
 ]
-NEEDS_TO = ('ipv4', 'ipv6', 'host', 'domain', 'keyword')
+NEEDS_TO = ('ipv4', 'ipv6', 'host', 'domain', 'keyword', 'desc')
 CHECK, UNCHECK = '\u2611', '\u2610'
 
 
@@ -1783,7 +1959,7 @@ class App(object):
 
     def _build_rules(self):
         tab = ttk.Frame(self.nb, padding=(0, 12, 0, 0))
-        self.nb.add(tab, text='Rules')
+        self.nb.add(tab, text='Remap rules')
         bar = ttk.Frame(tab)
         bar.pack(fill='x', pady=(0, 4))
         for text, cmd in (('Add...', self._rule_add),
@@ -2156,7 +2332,7 @@ class App(object):
         """Validate and save a new remaps dict; False if rejected."""
         errors = validate_remaps(remaps)
         if errors:
-            messagebox.showerror('Rules', '\n'.join(errors))
+            messagebox.showerror('Remap rules', '\n'.join(errors))
             return False
         self._pull()
         self.cfg['remaps'] = remaps
@@ -2226,7 +2402,7 @@ class App(object):
         havet = {r['from'].lower() for r in rm['text']}
         manual = {a.lower() for a in c['manual_accounts']}
         customs = {r['keyword'] for r in c['custom_removals']}
-        rows = {g: [] for g, _ in SCAN_GROUPS}
+        rows = {grp[0]: [] for grp in SCAN_GROUPS}
         info = rows['info']
 
         def add(cat, src, count, example, to='', checked=True):
@@ -2260,11 +2436,6 @@ class App(object):
         for tok, (n, _) in f['possible_accounts'].items():
             if tok.lower() not in manual:
                 add('account', tok, n, '', checked=False)
-        for key, (n, ex) in f['snmp'].items():
-            if key in customs:
-                info.append(('%s (custom keyword exists)' % key, n, ex))
-            else:
-                add('snmp', key, n, ex, '(rest of line)', checked=False)
         for line, (n, kw) in f['keywords'].items():
             words = line.split()
             idx = next((i for i, w in enumerate(words) if kw in w.lower()),
@@ -2272,6 +2443,9 @@ class App(object):
             phrase = ' '.join(words[:idx + 1])
             if phrase not in customs:
                 add('keyword', line, n, '', phrase, checked=False)
+        for text, (n, kind) in f.get('descs', {}).items():
+            if text.lower() not in havet:
+                add('desc', text, n, kind, checked=False)
         if f['accounts']:
             names = sorted(f['accounts'])
             info.append(('Accounts removed automatically (%d)' % len(names),
@@ -2279,15 +2453,16 @@ class App(object):
                          ', '.join(names[:8])
                          + (' ...' if len(names) > 8 else '')))
         for rule, (n, _) in sorted(f['secrets'].items()):
-            info.append(('Secrets removed: ' + rule, n, ''))
+            info.append((rule, n, ''))
 
-        for g, title in SCAN_GROUPS:
+        st.tag_configure('group', font=self.fonts['semi'])
+        for g, title, hint in SCAN_GROUPS:
             items = rows[g]
             if not items:
                 continue
-            parent = st.insert('', 'end', open=g != 'info',
+            parent = st.insert('', 'end', open=g != 'info', tags=('group',),
                                values=('', '%s  [%d]' % (title, len(items)),
-                                       '', '', ''))
+                                       '', '', hint))
             if g == 'info':
                 for src, n, ex in sorted(items, key=lambda x: -x[1]):
                     st.insert(parent, 'end', values=('', src, '',
@@ -2328,6 +2503,8 @@ class App(object):
         col = self.st.identify_column(event.x)
         if col == '#2' and r['cat'] == 'host':
             field, label = 'from', 'Hostname prefix to match:'
+        elif col == '#2' and r['cat'] == 'desc':
+            field, label = 'from', 'Text to replace (e.g. one word of it):'
         elif col == '#3' and r['cat'] in NEEDS_TO:
             field, label = 'to', ('Keyword to remove the value after:'
                                   if r['cat'] == 'keyword' else
@@ -2400,7 +2577,7 @@ class App(object):
             if r['cat'] in kinds:
                 remaps[kinds[r['cat']]].append(
                     {'from': r['from'], 'to': r['to'], 'on': True})
-            elif r['cat'] == 'domain':
+            elif r['cat'] in ('domain', 'desc'):
                 remaps['text'].append({'from': r['from'], 'to': r['to'],
                                        'word': True, 'case': False,
                                        'on': True})
@@ -2411,9 +2588,6 @@ class App(object):
         for r in rows:
             if r['cat'] == 'account':
                 self.cfg['manual_accounts'].append(r['from'])
-            elif r['cat'] == 'snmp':
-                self.cfg['custom_removals'].append(
-                    {'keyword': r['from'], 'what': 'line', 'on': True})
             elif r['cat'] == 'keyword':
                 self.cfg['custom_removals'].append(
                     {'keyword': r['to'], 'what': 'word', 'on': True})

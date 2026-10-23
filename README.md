@@ -24,10 +24,10 @@ It is one Python file that uses only the standard library: no installs, no inter
 1. Run `python ciscoscrub.py` to open the GUI.
 2. **Add files...** or **Add folder...** (subfolders are included by default).
 3. On the **Scan** tab, click **Scan inputs**. CiscoScrub lists what it found: IPv4 and IPv6 prefixes, hostname
-   prefixes, domains, possible account names, SNMP location / contact, and lines with password or key words that
-   no rule covers yet.
+   prefixes, domains, possible account names, lines with password or key words that no rule covers yet, and every
+   description and name as it will be sent, so you can spot building names or anything else to replace.
 4. Click **Suggest "To" values** (or double-click a To cell to type your own), check what you want, and click
-   **Add checked to rules**. Rules are saved to `scrub_rules.json` next to the script, so this is a one-time setup.
+   **Add checked to rules**. They appear on the **Remap rules** and **Removals** tabs and are saved to `scrub_rules.json` next to the script, so this is a one-time setup.
 5. Optional: on the **Test** tab, paste a few lines and see the scrubbed result as you type.
 6. Click **Scrub**. The output goes to `<input>_scrubbed\`. Each file gets a `_scrubbed` suffix, and line numbers
    are unchanged.
@@ -44,10 +44,13 @@ It is one Python file that uses only the standard library: no installs, no inter
 | **IPv4** | First two octets remapped per rule (`192.168` → `10.100`). Masks, multicast, version strings and SNMP OIDs are left alone. |
 | **IPv6** | First two hextets remapped per rule (`2001:db8` → `fd00:1`). Handles compressed forms, leading zeros, upper case, `/len` and `%zone`. |
 | **Hostnames** | Leading blocks remapped (`A-B-EE` → `HA-X-X`); the rest of the name is kept. Matches FQDNs, CDP/LLDP neighbors and descriptions, in any case. An optional role rule remaps the last block (`AS1` → `SW1`). |
-| **Secrets** | Built-in rules for `password`, `secret`, `key-string`, `enable`, SNMP communities and v3 keys, TACACS / RADIUS keys, ISAKMP / IKEv2 pre-shared keys, OSPF / BGP / NTP / HSRP authentication, WPA PSK and more. The encryption type is kept (`secret 9 <REMOVED>`). Each rule can be switched off. |
-| **Accounts** | Removed in config (`username`, `snmp-server user`) and in logs (`by X on vty0`, `[user: X]`, `User:X`, accounting logs). A first pass learns every name found and then removes it everywhere. |
+| **Secrets** | Built-in rules for `password` (and `challenge-password` etc.), `secret`, `key-string`, `enable`, SNMP communities and v3 keys, TACACS / RADIUS keys and CoA `server-key`, ISAKMP / IKEv2 pre-shared keys, OSPF / BGP / NTP / HSRP / NHRP authentication, WPA PSK and 9800 `set-key`, Smart Licensing `idtoken`, and passwords inside URLs (`ftp://user:pass@host`). The encryption type is kept (`secret 9 <REMOVED>`). |
+| **Private details** | Email addresses; call-home contact, phone, street address and customer / site / contract IDs; Smart Account and Virtual Account names; SNMP location and contact; LLDP-MED civic / geo location blocks; certificate subjects and LDAP DNs (`CN=`, `O=`, `OU=`, `DC=` values). |
+| **Accounts** | Removed in config (`username`, `snmp-server user`, `ip ftp username`) and in output and logs (`by X on vty0`, `[user: X]`, `User:X`, `X@vty0` in the archive log, 802.1x `User-Name:` including `DOMAIN\user` and `host/PC.domain`, accounting logs). MAB user names (MAC addresses) are left alone. A first pass learns every name found and then removes it everywhere. |
 | **Domains / text** | Replace-text rules (whole word, any case). |
 | **Custom** | "Remove the value after keyword X" (next word or rest of line), or an advanced regex. |
+
+Every built-in rule can be switched off on the **Removals** tab.
 
 **Account lists.** On the Removals tab you can add accounts by hand. An entry ending in `.` or `*` is a prefix:
 `adm.` removes every `adm.<name>`, and `adm*` removes anything that starts with `adm`.
@@ -69,6 +72,8 @@ One CSV per run. By default each unique value appears once per file, with a coun
 - A setting writes every occurrence instead.
 - The report also flags things worth a look:
   - **Residual**: a remapped prefix still appears in an unusual form.
+  - **Residual (hex)**: a remapped prefix written in hex, as in packet dumps and debugs (192.168 is `c0a8`, seen as
+    `C0A80A01` or `c0a8 0a01`). Hex isn't rewritten, so check these by hand; an occasional hit can be chance.
   - **Collision**: a "to" prefix already exists in the input, which would make the output ambiguous.
   - **Possible account**: a `word.word` name that was not removed.
   - **Residual hostname**: a hostname-shaped name whose prefix has no rule.
