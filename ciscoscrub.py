@@ -27,6 +27,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import string
 import sys
 import threading
@@ -79,6 +80,7 @@ DEFAULT_CONFIG = {
     'mask_secrets': True,
     'residual_hostnames': True,
     'quick_scan_mb': 300,
+    'parallel_files': 0,              # files scrubbed at once; 0 = auto
     # ipv4 / ipv6 / host_prefix / host_role: {'from', 'to', 'on'}
     # text: {'from', 'to', 'word': True, 'case': False, 'on'}
     # regex: {'pattern', 'replace', 'on'}
@@ -375,15 +377,17 @@ def _open_out(path):
 class Report(object):
     """One CSV per run: unique values per file, or every occurrence."""
 
-    def __init__(self, path, detail=False):
+    HEAD = ['File', 'Rule', 'Before', 'After', 'Count', 'First line']
+    HEAD_DETAIL = ['File', 'Line', 'Rule', 'Before', 'After']
+
+    def __init__(self, path, detail=False, part=False):
+        """part=True: no header or BOM (one file's rows, merged later)."""
         self.detail = detail
-        self.f = open(path, 'w', encoding='utf-8-sig', newline='')
+        self.f = open(path, 'w', encoding='utf-8' if part else 'utf-8-sig',
+                      newline='')
         self.w = csv.writer(self.f)
-        if detail:
-            self.w.writerow(['File', 'Line', 'Rule', 'Before', 'After'])
-        else:
-            self.w.writerow(['File', 'Rule', 'Before', 'After', 'Count',
-                             'First line'])
+        if not part:
+            self.w.writerow(self.HEAD_DETAIL if detail else self.HEAD)
         self.name = None
         self.hits = {}
         self.totals = {}
@@ -869,12 +873,44 @@ def _inside(path, folder):
     return path == folder or path.startswith(folder.rstrip('\\/') + os.sep)
 
 
+def _keep_awake(on):
+    """Stop Windows sleeping while this thread runs a job (no-op elsewhere)."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 | (0x00000001 if on else 0))   # ES_CONTINUOUS | SYSTEM
+    except Exception:
+        pass
+
+
+def _no_quick_edit():
+    """Turn off console QuickEdit: a click in the window would otherwise
+    freeze the run at its next print until a key is pressed."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)                       # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, (mode.value & ~0x40) | 0x80)
+    except Exception:
+        pass
+
+
 def run(inputs, cfg, out_dir=None, report_path=None,
         log=print, progress=None, cancel=None):
     """Scrub inputs (files and/or folders). Returns the report totals.
 
-    progress(phase, done_bytes, total_bytes, file_name) is called often.
+    progress(phase, done_bytes, total_bytes, label) is called often.
     """
+    _keep_awake(True)
+    try:
+        return _run(inputs, cfg, out_dir, report_path, log, progress, cancel)
+    finally:
+        _keep_awake(False)
+
+
+def _run(inputs, cfg, out_dir, report_path, log, progress, cancel):
     files = collect_files(inputs, cfg['extensions'], cfg['include_subfolders'])
     if not files:
         raise ScrubError('No %s files found.' % ' / '.join(cfg['extensions']))
@@ -889,57 +925,213 @@ def run(inputs, cfg, out_dir=None, report_path=None,
         raise ScrubError('The report must not be inside the output folder '
                          '(it holds the original values).')
 
-    eng = Scrubber(cfg)
-    total = sum(os.path.getsize(p) for p, _ in files)
+    eng = Scrubber(cfg)                    # validates the rules up front
+    sizes = [os.path.getsize(p) for p, _ in files]
+    total = sum(sizes)
     progress = progress or (lambda *a: None)
+    workers = worker_count(cfg, files)
+    if workers > 1:
+        log('Processing %d files, %d at a time.' % (len(files), workers))
 
     names = set()
     if cfg['learn_accounts']:
-        base = 0
-        for src, _ in files:
-            nm = os.path.basename(src)
-            names |= eng.learn(src, lambda d: progress('Learning accounts',
-                                                       base + d, total, nm),
-                               cancel)
-            base += os.path.getsize(src)
+        jobs = [(cfg, src) for src, _ in files]
+        for found in _run_jobs(_learn_job, jobs, sizes, workers,
+                               'Learning accounts', progress, cancel):
+            names |= found
         common = {n for n in names if n.lower() in eng.common}
         log('Learned %d account name(s); %d skipped as common words.'
             % (len(names - common), len(common)))
-    eng.set_learned(names)
 
-    rep = Report(report_path, cfg['report_detail'])
+    # Each file's report rows go to a part file next to the report (they hold
+    # original values, so not the system temp folder), merged in order.
+    parts_dir = report_path + '.parts'
+    os.makedirs(parts_dir, exist_ok=True)
     used = set()
-    base = 0
+    jobs, parts, shown_names = [], [], []
+    for i, (src, rel) in enumerate(files):
+        stem, ext = os.path.splitext(os.path.basename(src))
+        dst = os.path.normpath(os.path.join(out_dir, rel, stem + SUFFIX + ext))
+        n = 2
+        while os.path.normcase(dst) in used:
+            dst = os.path.normpath(os.path.join(
+                out_dir, rel, '%s%s_%d%s' % (stem, SUFFIX, n, ext)))
+            n += 1
+        used.add(os.path.normcase(dst))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shown = os.path.join(rel, os.path.basename(src)) if rel not in (
+            '', '.') else os.path.basename(src)
+        part = os.path.join(parts_dir, '%04d.csv' % i)
+        jobs.append((cfg, sorted(names), src, dst, part, shown))
+        parts.append(part)
+        shown_names.append(shown)
+
+    def done(i, result):
+        secs = max(result[1], 0.001)
+        log('Scrubbed %s in %.1f s (%.1f MB/s)'
+            % (shown_names[i], secs, sizes[i] / secs / 1e6))
+
+    totals = {}
     try:
-        for src, rel in files:
-            stem, ext = os.path.splitext(os.path.basename(src))
-            dst = os.path.normpath(os.path.join(out_dir, rel,
-                                                stem + SUFFIX + ext))
-            n = 2
-            while os.path.normcase(dst) in used:
-                dst = os.path.normpath(os.path.join(
-                    out_dir, rel, '%s%s_%d%s' % (stem, SUFFIX, n, ext)))
-                n += 1
-            used.add(os.path.normcase(dst))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shown = os.path.join(rel, os.path.basename(src)) if rel not in (
-                '', '.') else os.path.basename(src)
-            rep.start_file(shown)
-            log('Scrubbing %s' % shown)
-            t0 = time.time()
-            eng.scrub_file(src, dst, rep,
-                           lambda d: progress('Scrubbing', base + d, total,
-                                              shown), cancel)
-            rep.end_file()
-            size = os.path.getsize(src)
-            base += size
-            secs = max(time.time() - t0, 0.001)
-            log('  done in %.1f s (%.1f MB/s)' % (secs, size / secs / 1e6))
+        for file_totals, _ in _run_jobs(_scrub_job, jobs, sizes, workers,
+                                        'Scrubbing', progress, cancel, done):
+            for rule, n in file_totals.items():
+                totals[rule] = totals.get(rule, 0) + n
     finally:
-        rep.close()
+        with open(report_path, 'w', encoding='utf-8-sig', newline='') as out:
+            csv.writer(out).writerow(Report.HEAD_DETAIL
+                                     if cfg['report_detail'] else Report.HEAD)
+            for part in parts:
+                if os.path.exists(part):
+                    with open(part, encoding='utf-8', newline='') as f:
+                        shutil.copyfileobj(f, out)
+                    os.remove(part)
+        try:
+            os.rmdir(parts_dir)
+        except OSError:
+            pass
     log('Output: %s' % out_dir)
     log('Report: %s' % report_path)
-    return rep.totals
+    return totals
+
+
+MAX_PARALLEL = 3          # hosts are shared, so never more than this at once
+
+
+def worker_count(cfg, files):
+    """How many files to process at once ('parallel_files': 0 = auto)."""
+    n = cfg.get('parallel_files', 0) or max(1, (os.cpu_count() or 2) - 1)
+    n = max(1, min(n, MAX_PARALLEL, len(files)))
+    return n if n == 1 or _can_spawn() else 1
+
+
+def _can_spawn():
+    """Worker processes re-import the main script, which is impossible when
+    it was read from stdin or typed interactively (they would crash)."""
+    path = getattr(sys.modules.get('__main__'), '__file__', None)
+    return bool(path) and os.path.isfile(path)
+
+
+def _lower_priority():
+    """Run a worker process below normal priority (shared hosts)."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.SetPriorityClass(k.GetCurrentProcess(), 0x4000)  # BELOW_NORMAL
+    except Exception:
+        try:
+            os.nice(5)
+        except (AttributeError, OSError):
+            pass
+
+
+def _in_worker():
+    import multiprocessing
+    return multiprocessing.current_process().name != 'MainProcess'
+
+
+def _learn_job(cfg, src, progress, cancel):
+    if _in_worker():
+        _lower_priority()
+    return Scrubber(cfg).learn(src, progress, cancel)
+
+
+def _scrub_job(cfg, names, src, dst, part, shown, progress, cancel):
+    """Scrub one file; its report rows go to part. Returns (totals, secs)."""
+    if _in_worker():
+        _lower_priority()
+    eng = Scrubber(cfg)
+    eng.set_learned(names)
+    rep = Report(part, cfg['report_detail'], part=True)
+    rep.start_file(shown)
+    t0 = time.time()
+    try:
+        eng.scrub_file(src, dst, rep, progress, cancel)
+        rep.end_file()
+    finally:
+        rep.close()
+    return rep.totals, time.time() - t0
+
+
+class _QueueProgress(object):
+    """Picklable progress callback for a worker process."""
+
+    def __init__(self, q, i):
+        self.q, self.i = q, i
+
+    def __call__(self, done):
+        self.q.put((self.i, done))
+
+
+def _run_jobs(fn, jobs, sizes, workers, phase, progress, cancel,
+              on_done=None):
+    """Run fn(*job, progress, cancel) for each job and return the results in
+    job order. With workers > 1, jobs run in separate processes (one file
+    each); the regex scanning is CPU-bound, so threads would not help."""
+    total = sum(sizes)
+    done = [0] * len(jobs)
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+
+    def report():
+        progress(phase, sum(done), total,
+                 '%d of %d files' % (sum(1 for i, d in enumerate(done)
+                                         if d >= sizes[i]), len(jobs)))
+
+    if workers <= 1:
+        results = []
+        for i, job in enumerate(jobs):
+            def cb(d, i=i):
+                done[i] = d
+                report()
+            res = fn(*(job + (cb, cancel)))
+            done[i] = sizes[i]
+            if on_done:
+                on_done(i, res)
+            results.append(res)
+        return results
+
+    import concurrent.futures as cf
+    import multiprocessing
+    mgr = multiprocessing.Manager()
+    try:
+        q, stop = mgr.Queue(), mgr.Event()
+        if cancel is not None and cancel.is_set():   # pressed while starting
+            raise Cancelled()
+        results = [None] * len(jobs)
+        with cf.ProcessPoolExecutor(workers) as pool:
+            futs = {pool.submit(fn, *(job + (_QueueProgress(q, i), stop))): i
+                    for i, job in enumerate(jobs)}
+            pending = set(futs)
+            try:
+                while pending:
+                    fin, pending = cf.wait(pending, timeout=0.25)
+                    while not q.empty():
+                        i, d = q.get_nowait()
+                        done[i] = max(done[i], d)
+                    if cancel is not None and cancel.is_set():
+                        stop.set()
+                    for f in fin:
+                        i = futs[f]
+                        try:
+                            results[i] = f.result()   # re-raises worker errors
+                        except cf.process.BrokenProcessPool:
+                            raise ScrubError(
+                                'A worker process stopped unexpectedly. Set '
+                                '"Files at once" to 1 (Removals tab) and run '
+                                'again.')
+                        done[i] = sizes[i]
+                        if on_done:
+                            on_done(i, results[i])
+                    report()
+            except BaseException:
+                stop.set()                        # stop the other files too
+                for f in pending:
+                    f.cancel()
+                raise
+        return results
+    finally:
+        mgr.shutdown()
 
 
 # --------------------------------------------------------------------- scan
@@ -1662,13 +1854,20 @@ class App(object):
             ttk.Checkbutton(inner, text=text, variable=var).pack(anchor='w')
         self.v_sweep, self.v_ph, self.v_ext = (tk.StringVar(), tk.StringVar(),
                                                tk.StringVar())
+        self.v_par = tk.StringVar()
         grid = ttk.Frame(inner)
         grid.pack(fill='x', pady=4)
         ttk.Label(grid, text='Other word.word tokens').grid(row=0, column=0,
                                                             sticky='w')
-        ttk.Combobox(grid, textvariable=self.v_sweep, width=10,
+        sw = ttk.Frame(grid)
+        sw.grid(row=0, column=1, sticky='w')
+        ttk.Combobox(sw, textvariable=self.v_sweep, width=8,
                      values=('list', 'replace', 'off'),
-                     state='readonly').grid(row=0, column=1, sticky='w')
+                     state='readonly').pack(side='left')
+        ttk.Label(sw, text='   Files at once ').pack(side='left')
+        ttk.Combobox(sw, textvariable=self.v_par, width=5,
+                     values=('auto', '1', '2', '3'),
+                     state='readonly').pack(side='left')
         ttk.Label(grid, text='Placeholder').grid(row=1, column=0, sticky='w',
                                                  pady=(4, 0))
         ph = ttk.Frame(grid)
@@ -1737,6 +1936,8 @@ class App(object):
         c['residual_hostnames'] = self.v_reshost.get()
         c['account_sweep'] = self.v_sweep.get() or 'list'
         c['placeholder'] = self.v_ph.get().strip() or '<REMOVED>'
+        par = self.v_par.get()
+        c['parallel_files'] = int(par) if par.isdigit() else 0
         exts = ['.' + e.lstrip('.').lower() for e in _words(self.v_ext.get())]
         c['extensions'] = exts or ['.txt', '.log']
         c['common_words'] = _words(self.t_common.get('1.0', 'end'))
@@ -1773,6 +1974,8 @@ class App(object):
         self.v_reshost.set(c['residual_hostnames'])
         self.v_sweep.set(c['account_sweep'])
         self.v_ph.set(c['placeholder'])
+        self.v_par.set(str(c['parallel_files']) if c['parallel_files']
+                       else 'auto')
         self.v_ext.set(' '.join(c['extensions']))
 
     def _save_removals(self):
@@ -2583,6 +2786,7 @@ def main(argv=None):
     if not args.inputs:
         return gui(args.rules)
 
+    _no_quick_edit()
     cfg = load_config(args.rules)
     if args.no_learn:
         cfg['learn_accounts'] = False
