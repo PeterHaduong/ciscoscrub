@@ -520,14 +520,31 @@ class Scrubber(object):
                        r['pattern']) for r in on('regex')]
 
     def set_learned(self, names):
-        """Names found by learn(), plus the manual list, replaced everywhere."""
+        """Names found by learn(), plus the manual list, replaced everywhere.
+
+        A manual entry ending in '.' or '*' is a prefix: 'adm.' (or 'adm.*')
+        matches adm.jdoe, adm.j.doe ...; 'adm*' matches anything starting
+        with adm.
+        """
         learned = {n for n in names if n.lower() not in self.common}
-        manual = {n.strip() for n in self.cfg['manual_accounts'] if n.strip()}
-        names = sorted(learned | manual, key=len, reverse=True)
+        exact, prefixes = set(learned), []
+        for n in self.cfg['manual_accounts']:
+            n = n.strip()
+            if n.endswith(('.', '*')):
+                base = n.rstrip('*')
+                if len(base.rstrip('.')) >= 2:
+                    prefixes.append(base)
+            elif n:
+                exact.add(n)
+        self.exact_accounts = {n.lower() for n in exact}
+        alts = [_ci(n) for n in sorted(exact, key=len, reverse=True)]
+        for p in sorted(prefixes, key=len, reverse=True):
+            tail = r'[\w-]+(?:\.[\w-]+)*' if p.endswith('.') else r'[\w.-]*'
+            alts.append(_ci(p) + tail)
         self.learned_rx = None
-        if names:
+        if alts:
             self.learned_rx = re.compile(
-                '(?:' + '|'.join(_ci(n) for n in names) + r')(?![\w-]|\.\w)')
+                '(?:' + '|'.join(alts) + r')(?![\w-]|\.\w)')
 
     # -- applying
 
@@ -640,8 +657,10 @@ class Scrubber(object):
         p = _prev(m.string, m.start())
         if p in WORDISH or p in '.@-':
             return None
-        return (m.start(), m.end(), self.ph, 'Account (learned)', m.group(0),
-                self.ph)
+        tok = m.group(0)
+        rule = ('Account (learned)' if tok.lower() in self.exact_accounts
+                else 'Account (prefix)')
+        return m.start(), m.end(), self.ph, rule, tok, self.ph
 
     def _sweep(self, m):
         s = m.string
@@ -1427,6 +1446,9 @@ class App(object):
         inner.pack(fill='both', expand=True)
         ttk.Label(inner, text='Manual account list (one per line):').pack(
             anchor='w')
+        ttk.Label(inner, foreground='gray', text=(
+            'john.doe = exact.  adm.  or  adm.*  = every adm.<name>.  '
+            'adm* = anything starting adm.')).pack(anchor='w')
         self.t_manual = tk.Text(inner, height=5, width=36, font=self.mono)
         self.t_manual.pack(fill='x')
         self.v_learn, self.v_mask = tk.BooleanVar(), tk.BooleanVar()
