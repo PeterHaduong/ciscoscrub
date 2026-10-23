@@ -128,20 +128,42 @@ _L = r'(?P<v>[^\r\n]*[^\s])'                       # rest of the line
 # mode: None, 'email', 'dn', 'block' or 'notmac' (see Scrubber._removal).
 # A rule runs on a chunk only if one of its hints occurs in it. Order matters:
 # secrets, then private details, then accounts.
+_LVL = r'(?:level[ \t]+\d+[ \t]+)?'               # enable secret level 15 ...
+
 BUILTIN_RULES = [
+    ('crypt hash', 'secret', ('$',),
+     r'(?P<v>\$(?:\d{1,2}|[A-Za-z0-9]{1,3})\$[./A-Za-z0-9$]{4,})', False),
     ('password', 'secret', ('password',),
-     _w('password') + r'[ \t]+' + _T + _V, False),
+     _w('password') + r'[ \t]+' + _LVL + _T + _V, False),
+    ('password: X', 'secret', ('assword', 'ASSWORD'),
+     _ciw('password') + r'[ \t]*:[ \t]*(?P<v>[^\s"]\S*)', False),
     ('secret', 'secret', ('secret',),
-     _w('secret') + r'[ \t]+' + _T + _V, False),
+     _w('secret') + r'[ \t]+' + _LVL + _T + _V, False),
+    ('passwd', 'secret', ('passwd',),
+     _w('passwd') + r'[ \t]+' + _V, False),
+    ('ssh key-hash', 'secret', ('key-hash',),
+     r'key-hash[ \t]+\S+[ \t]+' + _V, False),
+    ('ssh public key', 'secret', ('sshkey',),
+     r'sshkey[ \t]+(?:(?:ssh-\S+|ecdsa-\S+)[ \t]+)?' + _V, False),
+    ('ezvpn group key', 'secret', ('group',),
+     _w('group') + r'[ \t]+\S+[ \t]+key[ \t]+' + _T + _V, False),
     ('key-string', 'secret', ('key-string',),
      _w('key-string') + r'[ \t]+' + _T + _V, False),
     ('authentication text', 'secret', ('authentication text',),
      r'authentication[ \t]+text[ \t]+' + _V, False),
+    ('hsrp plain authentication', 'secret', ('standby',),
+     r'standby[ \t]+(?:\d+[ \t]+)?authentication[ \t]+(?!md5\b|text\b)' + _V,
+     False),
+    ('show key chain', 'secret', ('-- text',),
+     r'key[ \t]+\d+[ \t]+--[ \t]+text[ \t]+' + _T + _V, False),
     ('server key', 'secret', ('-server key',),
      (r'tacacs-server[ \t]+key[ \t]+' + _T + _V,
       r'radius-server[ \t]+key[ \t]+' + _T + _V), False),
+    # " key 7 X" / " key X" under tacacs / radius / aaa-server / isakmp client
+    # groups; not "key chain X", " key 1" or "key config-key".
     ('key (server group)', 'secret', ('key',),
-     r'key[ \t]+\d[ \t]+' + _V, True),
+     r'key[ \t]+(?:\d[ \t]+(?!--)|(?!(?:chain|config-key|\d+|--)(?:\s|$)))'
+     + _V, True),
     ('server host key', 'secret', ('-server host', 'server-private'),
      (r'tacacs-server[ \t]+host[ \t]+\S+[^\r\n]*?[ \t]key[ \t]+' + _T + _V,
       r'radius-server[ \t]+host[ \t]+\S+[^\r\n]*?[ \t]key[ \t]+' + _T + _V,
@@ -150,28 +172,41 @@ BUILTIN_RULES = [
      _w('pac') + r'[ \t]+key[ \t]+' + _T + _V, False),
     ('snmp community', 'secret', ('snmp-server community',),
      r'snmp-server[ \t]+community[ \t]+' + _T + _V, False),
-    ('snmp community (show)', 'secret', ('Community name:',),
-     r'Community name:[ \t]*' + _V, False),
+    ('snmp community (show)', 'secret', ('Community ',),
+     r'Community (?:name|Index|SecurityName):[ \t]*' + _V, False),
     ('snmp host', 'secret', ('snmp-server host',),
-     r'snmp-server[ \t]+host[ \t]+\S+[^\r\n]*?[ \t]version[ \t]+'
-     r'(?:1|2c|3[ \t]+(?:auth|noauth|priv))[ \t]+' + _V, False),
+     (r'snmp-server[ \t]+host[ \t]+\S+[^\r\n]*?[ \t]version[ \t]+'
+      r'(?:1|2c|3[ \t]+(?:auth|noauth|priv))[ \t]+' + _V,
+      # v1 form: snmp-server host 192.0.2.1 [traps|informs] [vrf X] COMMUNITY
+      r'snmp-server[ \t]+host[ \t]+\S+(?:[ \t]+(?:traps|informs))?'
+      r'(?:[ \t]+vrf[ \t]+\S+)?[ \t]+'
+      r'(?P<v>(?!version\b|vrf\b|traps\b|informs\b)[^\s\d.]\S*)',
+      # ASA: snmp-server host inside 192.0.2.1 community X version 2c
+      r'snmp-server[ \t]+host[ \t][^\r\n]*?[ \t]community[ \t]+' + _V),
+     False),
     ('snmp user auth', 'secret', ('snmp-server user',),
-     r'snmp-server[ \t]+user[^\r\n]*?[ \t]auth[ \t]+(?:md5|sha\S*)[ \t]+'
-     + _V, False),
+     r'snmp-server[ \t]+user[^\r\n]*?[ \t]auth[ \t]+'
+     r'(?:md5|sha-2[ \t]+\d+|sha\S*)[ \t]+' + _V, False),
     ('snmp user priv', 'secret', ('snmp-server user',),
      r'snmp-server[ \t]+user[^\r\n]*?[ \t]priv[ \t]+'
      r'(?:(?:des\S*|3des|aes(?:-?\d+)?)[ \t]+(?:\d+[ \t]+)?)?' + _V, False),
     ('isakmp key', 'secret', ('isakmp',),
      r'crypto[ \t]+isakmp[ \t]+key[ \t]+' + _T + _V, False),
     ('pre-shared-key', 'secret', ('pre-shared-key',),
-     r'pre-shared-key[ \t]+(?:address[ \t]+\S+(?:[ \t]+\d+\.\d+\.\d+\.\d+)?'
+     r'pre-shared-key[ \t]+(?:address[ \t]+(?:ipv6[ \t]+)?\S+'
+     r'(?:[ \t]+\d+\.\d+\.\d+\.\d+)?'
      r'[ \t]+key[ \t]+|hostname[ \t]+\S+[ \t]+key[ \t]+'
      r'|(?:local|remote)[ \t]+)?' + _T + _V, False),
+    ('ikev2 pre-share key', 'secret', ('pre-share ',),
+     r'pre-share[ \t]+key[ \t]+' + _T + _V, False),
+    ('asa keys', 'secret', ('radius-common-pw', 'failover'),
+     (r'radius-common-pw[ \t]+' + _V,
+      r'failover[ \t]+key[ \t]+' + _T + _V), False),
     ('ospf/isis authentication-key', 'secret', ('authentication-key',),
      (r'ospf[^\r\n]*?authentication-key[ \t]+' + _T + _V,
       r'isis[^\r\n]*?authentication-key[ \t]+' + _T + _V), False),
     ('ntp authentication-key', 'secret', ('ntp',),
-     r'ntp[ \t]+authentication-key[ \t]+\d+[ \t]+md5[ \t]+' + _V, False),
+     r'ntp[ \t]+authentication-key[ \t]+\d+[ \t]+\S+[ \t]+' + _V, False),
     ('message-digest-key', 'secret', ('message-digest-key',),
      r'message-digest-key[ \t]+\d+[ \t]+md5[ \t]+' + _T + _V, False),
     ('ipsec spi', 'secret', ('spi',),
@@ -181,7 +216,7 @@ BUILTIN_RULES = [
     ('config-key', 'secret', ('config-key',),
      r'config-key[ \t]+password-encrypt[ \t]+' + _V, False),
     ('x-password', 'secret', ('-password ',),
-     r'[A-Za-z]-password[ 	]+' + _T + _V, False),
+     r'[A-Za-z]-password[ \t]+' + _T + _V, False),
     ('url credentials', 'secret', ('://',),
      r'://(?P<v>[^\s/@]+)@', False),
     ('server-key', 'secret', ('server-key',),
@@ -214,6 +249,25 @@ BUILTIN_RULES = [
      'email'),
     ('username', 'account', ('username',),
      r'username[ \t]+' + _A, True),
+    ('username (not at line start)', 'account', ('username',),
+     r'(?:mgmtuser|dot1x|automate-tester|\|)[ \t]*username[ \t]+' + _A,
+     False),
+    ('user-name (guest user)', 'account', ('user-name',),
+     r'user-name[ \t]+' + _A, True),
+    ('show users / show ssh', 'account', ('vty ', 'tty ', 'con ', 'aux ',
+                                          'Session started'),
+     tuple(w + r'[ \t]+\d+[ \t]+' + _A + r'[ \t]+(?:idle|\d)'
+           for w in ('vty', 'con', 'tty', 'aux'))
+     + (r'Session started[ \t]+' + _A,), False),
+    ('log: User X has exited', 'account', ('has exited',),
+     _w('User') + r'[ \t]+' + _A + r'[ \t]+has[ \t]+exited', False),
+    ('log: as X on', 'account', (' as ',),
+     _w('as') + r'[ \t]+' + _A + r'[ \t]+on[ \t]+(?:vty|tty|console|con|aux|\d)',
+     False),
+    ('log: user X failed', 'account', ('failed',),
+     _w('user') + r'[ \t]+' + _A + r'[ \t]+failed', False),
+    ('radius debug user-name', 'account', ('User-Name',),
+     r'User-Name[ \t]+\[1\][ \t]+\d+[ \t]+"(?P<v>[^"\r\n]+)"', False),
     ('ip ftp / http username', 'account', ('username',),
      r'ip[ \t]+(?:ftp|http[ \t]+client)[ \t]+username[ \t]+' + _A, False),
     ('user@line', 'account', ('@vty', '@tty', '@con', '@aux'),
@@ -233,6 +287,14 @@ BUILTIN_RULES = [
      False),
     ("log: user 'X'", 'account', None,
      _ciw('user') + r"[ \t]+'(?P<v>[^'\r\n]+)'", False),
+    # sshd / PAM (NX-OS, Linux-based platforms): users that may exist only in
+    # TACACS / RADIUS, or not at all ("invalid user").
+    ('log: for user X', 'account', ('user ',),
+     _w('for') + r'[ \t]+(?:invalid[ \t]+)?user[ \t]+' + _A, False),
+    ('log: sshd for X from', 'account', (' for ',),
+     (r'(?:Accepted|Failed)[ \t]+\S+[ \t]+for[ \t]+(?!invalid[ \t])' + _A
+      + r'[ \t]+from[ \t]',
+      r'[Ii]nvalid[ \t]+user[ \t]+' + _A + r'[ \t]+from[ \t]'), False),
 ]
 
 # Values after "password"/"secret" that are settings, not secrets.
@@ -240,9 +302,16 @@ NONSECRET = {
     'encryption', 'strength-check', 'secure-mode', 'restriction', 'policy',
     'history', 'required', 'prompt', 'reuse-interval', 'max-length',
     'min-length', 'lifetime', 'expiry', 'hash', 'encrypt', 'aes',
+    'for',                        # "Failed password for invalid user X"
+    'keyboard', 'publickey',      # ip ssh server algorithm authentication
+    'accept-lifetime', 'send-lifetime', 'cryptographic-algorithm',
+    'key-string',                 # key chain lines
+    'is', 'not', 'key',           # prose: "the secret is not displayed"
 }
-# Context matches that are not accounts.
-NONACCOUNT = {'console', 'unknown', 'none', 'system', 'n/a'}
+# Context matches that are not accounts ("AP User Name : Not Configured").
+NONACCOUNT = {'console', 'unknown', 'none', 'system', 'n/a', 'not',
+              'disabled', 'enabled', 'yes', 'no', 'true', 'false', 'null',
+              'idle', 'configured', 'set', 'any'}
 
 # MAB logins use the MAC as the user name; those are left alone.
 _MAC = re.compile(r'^(?:[0-9A-Fa-f]{2}[-:]?){5}[0-9A-Fa-f]{2}$'
@@ -259,7 +328,9 @@ HEX = frozenset(string.hexdigits)
 _SWEEP_CAND = re.compile(r'[A-Za-z]\.[A-Za-z]')
 _SWEEP_FULL = re.compile(r'([A-Za-z]+)\.([A-Za-z]+)(?![\w-]|\.\w|[/:])')
 # Hostname-shaped tokens: candidate is the last block ("-AS1").
-_HOST_LAST = re.compile(r'[-_][A-Za-z]*\d+(?![\w-])')
+# Letters then digits ("-AS1"), so "QOS-VOICE-1" / "vlan-group-10" are not
+# hostname-shaped; may be followed by _ or - ("TO_A-B-EE-AS1_Gi1/0/1").
+_HOST_LAST = re.compile(r'[-_][A-Za-z]+\d+(?![A-Za-z0-9])')
 
 
 # ------------------------------------------------------------------ helpers
@@ -334,12 +405,36 @@ def validate_remaps(prof):
             if key in seen:
                 errors.append('%s: duplicate "from" %r' % (kind, r['from']))
             seen.add(key)
+    seen = set()
     for r in prof.get('text', []):
-        if not r.get('from'):
+        f = r.get('from', '')
+        if not f:
             errors.append('text: empty "from"')
+        key = f if r.get('case', False) else f.lower()
+        if f and key in seen:
+            errors.append('text: duplicate "from" %r' % f)
+        seen.add(key)
     for r in prof.get('regex', []):
+        if not r.get('pattern'):
+            errors.append('regex: empty pattern')
+            continue
         try:
-            re.compile(r.get('pattern', ''))
+            rx = re.compile(r['pattern'])
+            if rx.match(''):
+                raise re.error('it can match empty text (e.g. x*), which '
+                               'would insert the replacement everywhere')
+            rep = r.get('replace', '')
+            if '\n' in rep or '\r' in rep or '\\n' in rep or '\\r' in rep:
+                raise re.error('the replacement must stay on one line, so '
+                               'line numbers keep matching')
+            # Check the replacement's \1 / \g<name> references now, not
+            # halfway through a run.
+            for g in re.findall(r'\\(\d+)|\\g<(\w+)>', r.get('replace', '')):
+                ref = g[0] or g[1]
+                if ref.isdigit() and int(ref) > rx.groups:
+                    raise re.error('invalid group reference %s' % ref)
+                if not ref.isdigit() and ref not in rx.groupindex:
+                    raise re.error('unknown group name %s' % ref)
         except re.error as e:
             errors.append('regex %r: %s' % (r.get('pattern'), e))
     return errors
@@ -366,9 +461,33 @@ def save_config(cfg, path=RULES_FILE):
     os.replace(tmp, path)
 
 
+def _v6_start_ok(s, i):
+    """Can an IPv6 address start at i? Not inside a word or another address,
+    but yes after "outside:" (ASA logs write interface:address)."""
+    p = _prev(s, i)
+    if p == ':':
+        k = i - 1                       # walk back over hex digits / colons
+        while k > 0 and (s[k - 1] in HEX or s[k - 1] == ':'):
+            k -= 1
+        return k > 0 and (s[k - 1].isalpha() or s[k - 1] == '_')
+    return not (p in WORDISH or p == '.')
+
+
+_ANSI_END = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]$')
+
+
 def _prev(s, i):
-    """Character before position i; a newline at the start of the text."""
-    return s[i - 1] if i > 0 else '\n'
+    """Character before position i; a newline at the start of the text, and
+    a space right after a terminal colour code (ESC[1m in captured prompts),
+    whose final letter is not part of the next word."""
+    if i <= 0:
+        return '\n'
+    c = s[i - 1]
+    if c.isalpha():
+        j = s.rfind('\x1b', max(0, i - 16), i)
+        if j >= 0 and _ANSI_END.match(s, j, i):
+            return ' '
+    return c
 
 
 def _at_line_start(s, i):
@@ -411,6 +530,16 @@ class _OrigMatch(object):
         return self.m.lastgroup
 
 
+def line_breaks(text, a=0, b=None):
+    """Line breaks in text[a:b]: LF, CRLF or a lone CR (old Mac-style files)."""
+    b = len(text) if b is None else b
+    n = text.count('\n', a, b)
+    cr = text.count('\r', a, b)
+    if cr:
+        n += cr - text.count('\r\n', a, b)
+    return n
+
+
 class _Lines(object):
     """Line numbers for match positions, counted incrementally."""
 
@@ -421,20 +550,45 @@ class _Lines(object):
     def at(self, pos):
         if pos < self.pos:
             self.pos, self.line = 0, self.base
-        self.line += self.text.count('\n', self.pos, pos)
+        self.line += line_breaks(self.text, self.pos, pos)
         self.pos = pos
         return self.line
 
 
+# Characters that can be part of a token we match (address, name, secret).
+_TOKEN = frozenset(string.ascii_letters + string.digits + '._:%/@\\-$*+=')
+
+
 def _chunks(f):
-    """Read text in chunks that always end on a line boundary."""
+    """Read text in chunks of about CHUNK_SIZE that end on a line boundary
+    (LF or CR).
+
+    Memory stays bounded even for a line hundreds of MB long (one-line JSON
+    output): a chunk with no line break is cut just after the last character
+    that cannot be part of a token (space, comma, quote, ...), so addresses
+    and names are never split. Rules that read the rest of a line can still
+    miss part of a line that long."""
+    carry = ''
     while True:
         data = f.read(CHUNK_SIZE)
         if not data:
+            if carry:
+                yield carry
             return
-        if not data.endswith('\n'):
-            data += f.readline()
-        yield data
+        data = carry + data
+        cut = max(data.rfind('\n'), data.rfind('\r')) + 1
+        if cut == len(data) and data.endswith('\r'):
+            cut -= 1                    # keep CR with a possible LF next
+        if cut <= 0:
+            cut = 0
+            for k in range(len(data) - 1, max(-1, len(data) - 65537), -1):
+                if data[k] not in _TOKEN:
+                    cut = k + 1
+                    break
+            if not cut:
+                cut = len(data)         # 64 KB with no break at all
+        carry = data[cut:]
+        yield data[:cut]
 
 
 def _open_in(path):
@@ -448,6 +602,11 @@ def _open_out(path):
 
 
 # ------------------------------------------------------------------- report
+
+def _cell(value):
+    """Stop Excel reading a report value as a formula (=, +, -, @)."""
+    return "'" + value if value[:1] in ('=', '+', '-', '@') else value
+
 
 class Report(object):
     """One CSV per run: unique values per file, or every occurrence."""
@@ -473,7 +632,8 @@ class Report(object):
     def add(self, rule, before, after, line):
         self.totals[rule] = self.totals.get(rule, 0) + 1
         if self.detail:
-            self.w.writerow([self.name, line, rule, before, after])
+            self.w.writerow([self.name, line, rule, _cell(before),
+                             _cell(after)])
             return
         key = (rule, before, after)
         hit = self.hits.get(key)
@@ -485,7 +645,8 @@ class Report(object):
     def end_file(self):
         rows = sorted(self.hits.items(), key=lambda kv: (kv[0][0], kv[1][1]))
         for (rule, before, after), (count, line) in rows:
-            self.w.writerow([self.name, rule, before, after, count, line])
+            self.w.writerow([self.name, rule, _cell(before), _cell(after),
+                             count, line])
         self.hits = {}
 
     def close(self):
@@ -532,9 +693,10 @@ class Scrubber(object):
             if not r.get('on', True) or not words:
                 continue
             val = r'(?P<v>[^\r\n]*[^\s])' if r.get('what') == 'line' else _V
+            # "keyword value", "keyword=value" or "keyword: value"
             pat = (_w(words[0]) + ''.join(r'[ \t]+' + re.escape(w)
                                           for w in words[1:])
-                   + r'[ \t]+' + _T + val)
+                   + r'(?:[ \t]*[:=][ \t]*|[ \t]+)' + _T + val)
             self.removals.append(('Custom: ' + ' '.join(words), 'secret',
                                   (words[0],), re.compile(pat), False, None))
         self.account_rules = [x for x in self.removals if x[1] == 'account']
@@ -551,13 +713,20 @@ class Scrubber(object):
             alts = '|'.join(re.escape(p) for p in self.v4)
             self.v4_rx = re.compile('(' + alts + r')\.(\d{1,3})\.(\d{1,3})'
                                     r'(?!\d|\.\d)')
-            self.res4 = re.compile('(?:' + alts + r')\.\d')
+            # Residual: a "from" left in the output. A "from" that is also
+            # another rule's "to" (10.20->10.30, 10.30->10.40) is expected in
+            # the output, so it is not checked.
+            left = [p for p in self.v4 if p not in set(self.v4.values())]
+            if left:
+                self.res4 = re.compile('(?:' + '|'.join(
+                    re.escape(p) for p in left) + r')\.\d')
             # The same prefix in hex (packet dumps, debugs): 192.168 = c0a8,
-            # seen as C0A80A01, 0xc0a80a01 or "c0a8 0a01".
+            # seen as C0A80A01, 0xc0a80a01, "c0a8 0a01" or c0a8:101.
             hx = ['%02x%02x' % tuple(int(o) for o in p.split('.'))
                   for p in self.v4]
             self.hex4 = re.compile('(?:' + '|'.join(hx)          # lowercase
-                                   + r') ?[0-9a-f]{4}(?![0-9a-f])')
+                                   + r')(?: ?[0-9a-f]{4}|:[0-9a-f]{1,4})'
+                                   r'(?![0-9a-f])')
             tos = set(self.v4.values()) - set(self.v4)
             if tos:
                 self.col4 = re.compile('(?:' + '|'.join(
@@ -574,7 +743,9 @@ class Scrubber(object):
             self.v6_rx = re.compile('(?:' + '|'.join(
                 '0' * z + '%x' % h for h in firsts
                 for z in range(5 - len('%x' % h))) + r')(?=:)[0-9a-f:.]*')
-            self.res6 = re.compile(_v6_prefix_rx(self.v6))
+            left = [k for k in self.v6 if k not in set(self.v6.values())]
+            if left:
+                self.res6 = re.compile(_v6_prefix_rx(left))
             self.hex6 = re.compile('(?:' + '|'.join(
                 '%04x ?%04x' % (k >> 16, k & 0xffff) for k in self.v6)
                 + r')(?![0-9a-f])')
@@ -617,7 +788,15 @@ class Scrubber(object):
                 else:
                     p = _ci(r['from'])
                 if r.get('word', True):
-                    p += r'(?![A-Za-z0-9])'
+                    # Boundaries are in the pattern (the lookbehind goes after
+                    # the literal so the scan stays fast), so a rejected spot
+                    # never hides a shorter rule's match. Only on a side where
+                    # "from" starts / ends with a letter or digit.
+                    f = r['from']
+                    if f[0].isalnum():
+                        p += '(?<![A-Za-z0-9]%s)' % p
+                    if f[-1].isalnum():
+                        p += r'(?![A-Za-z0-9])'
                 alts.append(p if self.text_low else '(?P<t%d>%s)' % (i, p))
             self.text_rx = re.compile('|'.join(alts))
 
@@ -631,7 +810,11 @@ class Scrubber(object):
         matches adm.jdoe, adm.j.doe ...; 'adm*' matches anything starting
         with adm.
         """
-        learned = {n for n in names if n.lower() not in self.common}
+        # Only distinctive names are replaced everywhere: john.doe, jd_x,
+        # CORP\jdoe, ops2. A plain word (backup, ise) would also hit config
+        # keywords, so it is removed only where it is clearly an account.
+        learned = {n for n in names if n.lower() not in self.common
+                   and any(c in n for c in '._\\/@-0123456789')}
         exact, prefixes = set(learned), []
         for n in self.cfg['manual_accounts']:
             n = n.strip()
@@ -668,7 +851,11 @@ class Scrubber(object):
         out = []
         last = 0
         if low:
-            found = (_OrigMatch(m, text) for m in rx.finditer(text.lower()))
+            src = text.lower()
+            if len(src) != len(text):   # e.g. 'İ' (only via the Test tab)
+                src = ''.join(c.lower() if len(c.lower()) == 1 else c
+                              for c in text)
+            found = (_OrigMatch(m, text) for m in rx.finditer(src))
         else:
             found = rx.finditer(text)
         for m in found:
@@ -714,8 +901,9 @@ class Scrubber(object):
             v = m.group('v')
             if v == ph or (kind == 'secret' and v.lower() in NONSECRET):
                 return None
-            if kind == 'account' and (v.isdigit() or v.lower() in NONACCOUNT):
-                return None
+            if kind == 'account' and (v.isdigit() or v.lower() in NONACCOUNT
+                                      or not any(c.isalnum() for c in v)):
+                return None              # "*****" (masked) is not a name
             if bol and not _at_line_start(m.string, m.start()):
                 return None
             if mode == 'notmac' and _MAC.match(v):
@@ -727,7 +915,10 @@ class Scrubber(object):
                     return None
                 ls = s.rfind('\n', 0, m.start()) + 1
                 le = s.find('\n', m.start())
-                if not _DN_STRONG.search(s, ls, le if le >= 0 else len(s)):
+                # cn= / ou= / dc= on the line, or one attribute alone on its
+                # line (show crypto pki certificates prints o=, l=, st= so)
+                if not (_DN_STRONG.search(s, ls, le if le >= 0 else len(s))
+                        or not s[ls:m.start()].strip()):
                     return None
             a, b = m.span('v')
             if mode == 'block':
@@ -759,11 +950,10 @@ class Scrubber(object):
         return a, m.end(), new, 'IPv4 ' + pre, m.group(0), new
 
     def _v6(self, m):
-        p = _prev(m.string, m.start())
-        if p in WORDISH or p in ':.':
+        if not _v6_start_ok(m.string, m.start()):
             return None
         core = m.group(0)
-        for _ in range(3):
+        for _ in range(4):
             try:
                 addr = ipaddress.IPv6Address(core)
                 break
@@ -777,25 +967,47 @@ class Scrubber(object):
         top = n >> 96
         if top not in self.v6:
             return None
-        new = str(ipaddress.IPv6Address((self.v6[top] << 96)
-                                        | (n & ((1 << 96) - 1))))
+        new_int = (self.v6[top] << 96) | (n & ((1 << 96) - 1))
+        if '.' in core:
+            # Embedded IPv4 (2001:db8::192.168.1.1): keep it dotted and remap
+            # it too; str() would turn it into hex (c0a8:101), still readable.
+            tail = self._v4_text(core.rsplit(':', 1)[1])
+            head = str(ipaddress.IPv6Address(new_int & ~0xffffffff))
+            new = head + tail if head.endswith('::') else head[:-3] + tail
+        else:
+            new = str(ipaddress.IPv6Address(new_int))
         if core.upper() == core and core.lower() != core:
             new = new.upper()
         rule = 'IPv6 %x:%x' % (top >> 16, top & 0xffff)
         return m.start(), m.start() + len(core), new, rule, core, new
 
+    def _v4_text(self, ip):
+        """Remap a dotted IPv4 string if a rule covers it."""
+        parts = ip.split('.')
+        if (len(parts) == 4 and all(p.isdigit() and int(p) <= 255
+                                    for p in parts)):
+            pre = '%d.%d' % (int(parts[0]), int(parts[1]))
+            if pre in self.v4:
+                return '%s.%s.%s' % (self.v4[pre], parts[2], parts[3])
+        return ip
+
     def _host(self, m):
-        p = _prev(m.string, m.start())
-        if p in WORDISH or p in '.-':
+        # A letter or digit before means the prefix is inside another word;
+        # '_', '-' and '.' are separators ("TO_A-B-EE-AS1_Gi1/0/1").
+        if _prev(m.string, m.start()).isalnum():
             return None
         pre, rest = m.group('pre'), m.group('rest')
         new = match_case(pre, self.hp[pre.upper()])
         if rest and self.hr:
-            cut = max(rest.rfind('-'), rest.rfind('_'))
-            last = rest[cut + 1:]
-            role = self.hr.get(last.upper())
-            if role is not None:
-                rest = rest[:cut + 1] + match_case(last, role)
+            # The role is the first later block that has a role rule, so
+            # "A-B-EE-AS1_Gi1" still gets AS1 remapped.
+            parts = re.split('([-_])', rest)
+            for k in range(2, len(parts), 2):
+                role = self.hr.get(parts[k].upper())
+                if role is not None:
+                    parts[k] = match_case(parts[k], role)
+                    break
+            rest = ''.join(parts)
         new += rest
         if new == m.group(0):
             return None
@@ -808,8 +1020,6 @@ class Scrubber(object):
             r = self.text[self.text_map[src.lower()]]
         else:
             r = self.text[int(m.lastgroup[1:])]
-        if r.get('word', True) and _prev(m.string, m.start()).isalnum():
-            return None
         new = r['to'] if r.get('case', False) else match_case(src, r['to'])
         return m.start(), m.end(), new, 'Text ' + r['from'], src, new
 
@@ -851,13 +1061,20 @@ class Scrubber(object):
 
     # -- checks (report only)
 
-    def _check(self, rule, after, before_hex=False):
+    def _check(self, rule, after, kind='v4'):
+        """Report-only check. kind sets what may come before a match:
+        v4 (not a digit; '.' allowed, so OIDs are flagged), col4 (not a
+        digit or '.'), v6 (a valid IPv6 start) or hex (not a hex digit)."""
         def fn(m):
             s, a = m.string, m.start()
             p = _prev(s, a)
-            if before_hex and (p in HEX or p == ':'):
-                return None
-            if not before_hex and p.isdigit():
+            if kind == 'v6':
+                if not _v6_start_ok(s, a):
+                    return None
+            elif kind == 'hex':
+                if p in HEX:
+                    return None
+            elif p.isdigit() or (kind == 'col4' and p == '.'):
                 return None
             tok = _token(s, a, m.end())
             return a, m.end(), tok, rule, tok, after
@@ -882,9 +1099,13 @@ class Scrubber(object):
             return None
         tok = s[j:m.end()]
         up = tok.upper()
-        for t in self.h_tos:
-            if up.startswith(t) and up[len(t):len(t) + 1] in ('-', '_', ''):
-                return None
+        for t in self.h_tos:              # a remapped name, maybe after TO_
+            k = up.find(t)
+            while k >= 0:
+                if ((k == 0 or up[k - 1] in '-_.')
+                        and up[k + len(t):k + len(t) + 1] in ('-', '_', '')):
+                    return None
+                k = up.find(t, k + 1)
         return j, m.end(), tok, 'Residual hostname', tok, '(left as is)'
 
     def scrub_text(self, text):
@@ -893,10 +1114,11 @@ class Scrubber(object):
         # Collisions are checked on the original text.
         if self.col4 is not None:
             ap(self.col4, self._check('Warning: collision IPv4',
-                                      '(already in input)'), text, False)
+                                      '(already in input)', 'col4'),
+               text, False)
         if self.col6 is not None:
             ap(self.col6, self._check('Warning: collision IPv6',
-                                      '(already in input)', True), text, False)
+                                      '(already in input)', 'v6'), text, False)
 
         for label, kind, hints, rx, bol, mode in self.removals:
             if hints is None or any(h in text for h in hints):
@@ -922,12 +1144,12 @@ class Scrubber(object):
             ap(self.res4, self._check('Residual IPv4', '(left as is)'),
                text, False)
         if self.res6 is not None:
-            ap(self.res6, self._check('Residual IPv6', '(left as is)', True),
+            ap(self.res6, self._check('Residual IPv6', '(left as is)', 'v6'),
                text, False)
         for rx, rule in ((self.hex4, 'Residual IPv4 (hex)'),
                          (self.hex6, 'Residual IPv6 (hex)')):
             if rx is not None:
-                ap(rx, self._check(rule, '(hex; check by hand)', True),
+                ap(rx, self._check(rule, '(hex; check by hand)', 'hex'),
                    text, False, low=True)
         if self.cfg['residual_hostnames']:
             ap(_HOST_LAST, self._host_residual, text, False)
@@ -973,7 +1195,7 @@ class Scrubber(object):
                     if cancel is not None and cancel.is_set():
                         raise Cancelled()
                     out.write(self.scrub_text(chunk))
-                    self.line += chunk.count('\n')
+                    self.line += line_breaks(chunk)
                     done += len(chunk)
                     if progress:
                         progress(done)
@@ -1311,7 +1533,7 @@ _KEYWORDS = re.compile(r'password|secret|key|community|psk|credential')
 _KW_SAFE = re.compile(
     r'(?:no )?(?:service password-|password encryption|key chain |'
     r'key \d+$|security passwords|crypto key |key config-key|'
-    r'.*password-policy|.*key-string <)')
+    r'crypto ikev2 keyring |.*password-policy|.*key-string <)')
 _HOST_ANY = re.compile(r'[A-Za-z]+(?:[-_][A-Za-z]+)+[-_][A-Za-z]*\d+(?![\w-])')
 
 
@@ -1427,7 +1649,8 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
                         if p.isdigit() or p == '.':
                             continue
                         o = [int(x) for x in m.groups()]
-                        if max(o) > 255 or o[0] in (0, 127) or o[0] >= 224:
+                        if (max(o) > 255 or o[0] in (0, 127) or o[0] >= 224
+                                or o[:2] == [169, 254]):    # link-local
                             continue
                         bump(v4, '%d.%d' % (o[0], o[1]), m.group(0))
                     for m in _IP6_CAND.finditer(chunk):
@@ -1468,7 +1691,7 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
                         if eng.ph not in line and not _KW_SAFE.match(line):
                             bump(keywords, line[:150], m.group(0))
 
-                    eng.line += chunk.count('\n')
+                    eng.line += line_breaks(chunk)
                     read += len(chunk)
                     done += len(chunk)
                     if progress:
@@ -1510,17 +1733,42 @@ def scan(files, cfg, progress=None, cancel=None, limit=None):
     return found
 
 
+def _v4_pool():
+    """Prefixes to suggest: private space first, then any other a.b."""
+    for i in range(100, 256):
+        yield '10.%d' % i
+    for i in range(16, 32):
+        yield '172.%d' % i
+    for i in range(1, 100):
+        yield '10.%d' % i
+    for a in range(11, 224):
+        if a not in (127, 172, 192):
+            for b in range(256):
+                yield '%d.%d' % (a, b)
+
+
 def suggest_v4(n, avoid):
-    """n unused 'a.b' prefixes (not in avoid) to map to."""
+    """Up to n unused 'a.b' prefixes (not in avoid) to map to."""
     out = []
-    for p in (['10.%d' % i for i in range(100, 256)]
-              + ['172.%d' % i for i in range(16, 32)]
-              + ['10.%d' % i for i in range(1, 100)]):
+    for p in _v4_pool():
         if len(out) == n:
             break
         if p not in avoid:
             out.append(p)
     return out
+
+
+def keyword_phrase(line, kw):
+    """The words of line up to and including the one holding kw, cut where
+    the value starts: 'wifi psk=X' -> 'wifi psk'."""
+    low = line.lower()
+    i = low.find(kw)
+    if i < 0:
+        return ' '.join(line.split()[:1])
+    j = i + len(kw)
+    while j < len(line) and (line[j].isalnum() or line[j] in '-_'):
+        j += 1
+    return ' '.join(line[:j].split())
 
 
 def suggest_v6(n, avoid):
@@ -1801,6 +2049,7 @@ class App(object):
         self.worker = None
         self.found = None
         self.scan_rows = {}
+        self.scan_edits = {}            # (cat, found value) -> user's edits
         self.prog = None
         self.t_start = 0
         self.last_out = None
@@ -2114,7 +2363,8 @@ class App(object):
         c['placeholder'] = self.v_ph.get().strip() or '<REMOVED>'
         par = self.v_par.get()
         c['parallel_files'] = int(par) if par.isdigit() else 0
-        exts = ['.' + e.lstrip('.').lower() for e in _words(self.v_ext.get())]
+        exts = ['.' + e.lstrip('*.').lower() for e in _words(self.v_ext.get())
+                if e.lstrip('*.')]
         c['extensions'] = exts or ['.txt', '.log']
         c['common_words'] = _words(self.t_common.get('1.0', 'end'))
         c['sweep_exclude'] = _words(self.t_sweepex.get('1.0', 'end'))
@@ -2393,22 +2643,31 @@ class App(object):
 
     def _render_scan(self):
         st, f, c = self.st, self.found, self.cfg
+        for r in self.scan_rows.values():      # keep edits across redraws
+            self._remember(r)
         st.delete(*st.get_children())
         self.scan_rows = {}
         rm = c['remaps']
-        have4 = {parse_v4_prefix(r['from']) for r in rm['ipv4']}
-        have6 = {parse_v6_prefix(r['from']) for r in rm['ipv6']}
-        haveh = {r['from'].upper() for r in rm['host_prefix']}
-        havet = {r['from'].lower() for r in rm['text']}
+        on = lambda kind: [r for r in rm[kind] if r.get('on', True)]
+        have4 = {parse_v4_prefix(r['from']) for r in on('ipv4')}
+        have6 = {parse_v6_prefix(r['from']) for r in on('ipv6')}
+        haveh = {r['from'].upper() for r in on('host_prefix')}
+        havet = {r['from'].lower() for r in on('text')}
         manual = {a.lower() for a in c['manual_accounts']}
         customs = {r['keyword'] for r in c['custom_removals']}
         rows = {grp[0]: [] for grp in SCAN_GROUPS}
         info = rows['info']
 
         def add(cat, src, count, example, to='', checked=True):
-            rows[cat].append({'cat': cat, 'from': src, 'to': to,
-                              'checked': checked, 'count': count,
-                              'example': example})
+            row = {'cat': cat, 'from': src, 'to': to, 'checked': checked,
+                   'count': count, 'example': example, 'key': (cat, src)}
+            row.update(self.scan_edits.get(row['key'], {}))   # user's edits
+            rows[cat].append(row)
+
+        def host_handled(p):
+            up = p.upper()
+            return any(up == h or up.startswith(h + '-')
+                       or up.startswith(h + '_') for h in haveh)
 
         for p, (n, ex) in f['ipv4'].items():
             if p in have4:
@@ -2422,7 +2681,9 @@ class App(object):
             else:
                 add('ipv6', p, n, ex)
         for p, (n, ex) in f['hosts'].items():
-            if p.upper() not in haveh:
+            if host_handled(p):
+                info.append(('Hostname prefix %s (rule exists)' % p, n, ex))
+            else:
                 add('host', p, n, ex)
         if f['host_mapped']:
             n = sum(v[0] for v in f['host_mapped'].values())
@@ -2437,10 +2698,7 @@ class App(object):
             if tok.lower() not in manual:
                 add('account', tok, n, '', checked=False)
         for line, (n, kw) in f['keywords'].items():
-            words = line.split()
-            idx = next((i for i, w in enumerate(words) if kw in w.lower()),
-                       len(words) - 1)
-            phrase = ' '.join(words[:idx + 1])
+            phrase = keyword_phrase(line, kw)
             if phrase not in customs:
                 add('keyword', line, n, '', phrase, checked=False)
         for text, (n, kind) in f.get('descs', {}).items():
@@ -2487,11 +2745,17 @@ class App(object):
                                   r['from'], r['to'],
                                   '{:,}'.format(r['count']), r['example']))
 
+    def _remember(self, r):
+        """Keep a row's edits across re-renders (until the next scan)."""
+        self.scan_edits[r['key']] = {'from': r['from'], 'to': r['to'],
+                                     'checked': r['checked']}
+
     def _scan_click(self, event):
         iid = self.st.identify_row(event.y)
         if iid in self.scan_rows and self.st.identify_column(event.x) == '#1':
             r = self.scan_rows[iid]
             r['checked'] = not r['checked']
+            self._remember(r)
             self._show_row(iid)
             return 'break'
 
@@ -2516,6 +2780,7 @@ class App(object):
         if val is not None:
             r[field] = val.strip()
             r['checked'] = True
+            self._remember(r)
             self._show_row(iid)
         return 'break'
 
@@ -2538,14 +2803,20 @@ class App(object):
                              avoid4))
         s6 = iter(suggest_v6(sum(1 for _, r in rows if r['cat'] == 'ipv6'),
                              avoid6))
-        used_to = {r['to'].upper() for r in rm['host_prefix']}
-        used_dom = {r['to'].lower() for r in rm['text']} | set(f['domains'])
+        typed = [r for r in self.scan_rows.values() if r['to']]
+        used_to = ({r['to'].upper() for r in rm['host_prefix']}
+                   | {r['to'].upper() for r in typed if r['cat'] == 'host'})
+        used_dom = ({r['to'].lower() for r in rm['text']} | set(f['domains'])
+                    | {r['to'].lower() for r in typed if r['cat'] == 'domain'})
         nh = nd = 0
+        short = 0
         for iid, r in rows:
             if r['cat'] == 'ipv4':
-                r['to'] = next(s4)
+                r['to'] = next(s4, '')
+                short += not r['to']
             elif r['cat'] == 'ipv6':
-                r['to'] = next(s6)
+                r['to'] = next(s6, '')
+                short += not r['to']
             elif r['cat'] == 'host':
                 while suggest_host(r['from'], nh).upper() in used_to:
                     nh += 1
@@ -2556,7 +2827,12 @@ class App(object):
                     nd += 1
                 r['to'] = suggest_domain(nd)
                 nd += 1
+            self._remember(r)
             self._show_row(iid)
+        if short:
+            messagebox.showwarning('Suggest', (
+                '%d row(s) could not be given a free prefix. Type a To value '
+                'for them, or untick them.' % short))
 
     def _add_checked(self):
         rows = [r for r in self.scan_rows.values() if r['checked']]
@@ -2570,6 +2846,21 @@ class App(object):
                 'These need a "To" value (double-click To, or use Suggest):'
                 '\n\n' + '\n'.join(missing[:15])))
             return
+        # A keyword must leave something after it on the line, or the rule
+        # would hold the secret itself and remove nothing.
+        def nothing_after(r):
+            line = ' '.join(r['from'].split()).lower()
+            kw = ' '.join(r['to'].split()).lower()
+            i = line.find(kw)
+            return i >= 0 and not line[i + len(kw):].strip(' :=')
+        whole = [r['from'] for r in rows if r['cat'] == 'keyword'
+                 and nothing_after(r)]
+        if whole:
+            messagebox.showwarning('Scan', (
+                'For these lines, To must be only the keyword before the '
+                'value (e.g. "snmp-server community"), not the whole line:'
+                '\n\n' + '\n'.join(whole[:15])))
+            return
         self._pull()
         remaps = copy.deepcopy(self.cfg['remaps'])
         kinds = {'ipv4': 'ipv4', 'ipv6': 'ipv6', 'host': 'host_prefix'}
@@ -2577,10 +2868,27 @@ class App(object):
             if r['cat'] in kinds:
                 remaps[kinds[r['cat']]].append(
                     {'from': r['from'], 'to': r['to'], 'on': True})
-            elif r['cat'] in ('domain', 'desc'):
+            elif r['cat'] == 'domain':
                 remaps['text'].append({'from': r['from'], 'to': r['to'],
                                        'word': True, 'case': False,
                                        'on': True})
+        # Text rules run after the IP / hostname remaps, so a description is
+        # matched as it will look then.
+        descs = [r for r in rows if r['cat'] == 'desc']
+        if descs:
+            cfg2 = copy.deepcopy(self.cfg)
+            cfg2['remaps'] = copy.deepcopy(remaps)
+            cfg2['remaps']['text'] = []
+            try:
+                eng = Scrubber(cfg2)
+                eng.set_learned(())
+                after = lambda s: eng.scrub_text(s)
+            except ScrubError:
+                after = lambda s: s
+            for r in descs:
+                remaps['text'].append({'from': after(r['from']),
+                                       'to': r['to'], 'word': True,
+                                       'case': False, 'on': True})
         errors = validate_remaps(remaps)
         if errors:
             messagebox.showerror('Scan', 'Not added:\n' + '\n'.join(errors))
@@ -2612,9 +2920,16 @@ class App(object):
                 raise ScrubError('Old .xls files are not supported; save it '
                                  'as .xlsx or CSV, or use Paste node list.')
             else:
-                with _open_in(path) as fh:
-                    text = fh.read()
-        except (OSError, ScrubError, ET.ParseError) as e:
+                with open(path, 'rb') as fh:
+                    raw = fh.read()
+                # Excel "Unicode Text" is UTF-16; CSV UTF-8 has a BOM.
+                if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+                    text = raw.decode('utf-16')
+                elif raw[:3] == b'\xef\xbb\xbf':
+                    text = raw[3:].decode('utf-8', 'replace')
+                else:
+                    text = raw.decode('latin-1')
+        except (OSError, ScrubError, ET.ParseError, UnicodeError) as e:
             messagebox.showerror('Import', str(e))
             return
         self._add_nodes(text, os.path.basename(path))
@@ -2698,8 +3013,8 @@ class App(object):
         self.t_out.insert('1.0', out)
         for line, rule, before, after in rows:
             self.ht.insert('', 'end', values=(line, rule, before, after))
-            if after.startswith('('):
-                continue
+            if not after or after.startswith('('):
+                continue                # nothing visible to highlight
             pos = '%d.0' % line
             while True:
                 pos = self.t_out.search(after, pos, '%d.end' % line)
@@ -2707,6 +3022,8 @@ class App(object):
                     break
                 end = '%s+%dc' % (pos, len(after))
                 self.t_out.tag_add('hit', pos, end)
+                if self.t_out.compare(end, '<=', pos):
+                    break
                 pos = end
         self.t_out.config(state='disabled')
 
@@ -2884,7 +3201,9 @@ class App(object):
                 self.v_status.set('Cancelled.')
             elif name == 'scan':
                 self.found = result
-                self._log('Scan finished.')
+                self.scan_edits = {}
+                self._log('Scan cancelled (partial results).'
+                          if result['cancelled'] else 'Scan finished.')
                 self._render_scan()
                 self.nb.select(0)
             else:

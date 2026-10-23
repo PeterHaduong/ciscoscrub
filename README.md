@@ -44,9 +44,10 @@ It is one Python file that uses only the standard library: no installs, no inter
 | **IPv4** | First two octets remapped per rule (`192.168` → `10.100`). Masks, multicast, version strings and SNMP OIDs are left alone. |
 | **IPv6** | First two hextets remapped per rule (`2001:db8` → `fd00:1`). Handles compressed forms, leading zeros, upper case, `/len` and `%zone`. |
 | **Hostnames** | Leading blocks remapped (`A-B-EE` → `HA-X-X`); the rest of the name is kept. Matches FQDNs, CDP/LLDP neighbors and descriptions, in any case. An optional role rule remaps the last block (`AS1` → `SW1`). |
-| **Secrets** | Built-in rules for `password` (and `challenge-password` etc.), `secret`, `key-string`, `enable`, SNMP communities and v3 keys, TACACS / RADIUS keys and CoA `server-key`, ISAKMP / IKEv2 pre-shared keys, OSPF / BGP / NTP / HSRP / NHRP authentication, WPA PSK and 9800 `set-key`, Smart Licensing `idtoken`, and passwords inside URLs (`ftp://user:pass@host`). The encryption type is kept (`secret 9 <REMOVED>`). |
+| **Secrets** | Built-in rules for `password` (and `challenge-password`, `Password:` in show output), `secret` (including `enable secret level 15`), `key-string`, `enable`, SNMP communities (v1/v2c/v3 hosts, `show snmp community`) and v3 keys, TACACS / RADIUS keys (with or without a type digit) and CoA `server-key`, ISAKMP / IKEv2 / EZVPN pre-shared keys, OSPF / BGP / NTP / HSRP / NHRP authentication, WPA PSK and 9800 `set-key`, `show key chain` output, ASA `passwd` / `failover key` / `radius-common-pw`, SSH public keys and key hashes, Smart Licensing `idtoken`, and passwords inside URLs (`ftp://user:pass@host`). The encryption type is kept (`secret 9 <REMOVED>`). |
+| **Password hashes** | Any crypt-style hash (`$1$…`, `$5$…`, `$8$…`, `$9$…`, `$14$…`) is removed wherever it appears, even without a known keyword. |
 | **Private details** | Email addresses; call-home contact, phone, street address and customer / site / contract IDs; Smart Account and Virtual Account names; SNMP location and contact; LLDP-MED civic / geo location blocks; certificate subjects and LDAP DNs (`CN=`, `O=`, `OU=`, `DC=` values). |
-| **Accounts** | Removed in config (`username`, `snmp-server user`, `ip ftp username`) and in output and logs (`by X on vty0`, `[user: X]`, `User:X`, `X@vty0` in the archive log, 802.1x `User-Name:` including `DOMAIN\user` and `host/PC.domain`, accounting logs). MAB user names (MAC addresses) are left alone. A first pass learns every name found and then removes it everywhere. |
+| **Accounts** | Removed in config (`username`, `snmp-server user`, `ip ftp username`) and in output and logs (`show users` / `show ssh` tables, `by X on vty0`, `[user: X]`, `User:X`, `X@vty0` in the archive log, 802.1x `User-Name:` including `DOMAIN\user` and `host/PC.domain`, sshd / PAM logs such as `Failed password for invalid user X`, accounting logs). MAB user names (MAC addresses) are left alone. A first pass learns every name found and then removes it everywhere it appears, if it is distinctive (`john.doe`, `jd_x`, `ops2`); a plain word such as `backup` is removed only where it is clearly an account, so config keywords are not damaged. |
 | **Domains / text** | Replace-text rules (whole word, any case). |
 | **Custom** | "Remove the value after keyword X" (next word or rest of line), or an advanced regex. |
 
@@ -80,8 +81,11 @@ One CSV per run. By default each unique value appears once per file, with a coun
 
 ## Large files and speed
 
-- Files are streamed in 4 MB chunks, so memory use stays small whatever the file size. Every byte and line
-  ending is kept as it was.
+- Files are streamed in 4 MB chunks, so memory use stays small whatever the file size, even with a single line
+  hundreds of MB long (NX-OS `| json` output). Every byte and line ending (LF, CRLF or CR) is kept as it was,
+  including binary bytes and terminal colour codes.
+- Tested on a generated 2 GB NX-OS `show tech-support details`-style file (accounting and PAM logs, one-line JSON,
+  XML, packet dumps, binary bytes): no leaks, line counts unchanged.
 - Typical speed is 25–35 MB/s per file, so a 6 GB show tech takes about 4 minutes.
 - Several files can be scrubbed in parallel, at most 3 at once and at below-normal priority, so shared hosts
   stay responsive.
