@@ -435,6 +435,8 @@ def validate_remaps(prof):
                     raise re.error('invalid group reference %s' % ref)
                 if not ref.isdigit() and ref not in rx.groupindex:
                     raise re.error('unknown group name %s' % ref)
+            # Bad escapes such as \q in the replacement (works on 3.6 too)
+            re.compile('(?:%s)|' % r['pattern']).sub(rep, '')
         except re.error as e:
             errors.append('regex %r: %s' % (r.get('pattern'), e))
     return errors
@@ -443,14 +445,43 @@ def validate_remaps(prof):
 def load_config(path=RULES_FILE):
     """Load the rules file, creating it with defaults if missing."""
     cfg = copy.deepcopy(DEFAULT_CONFIG)
-    if not os.path.exists(path):
-        save_config(cfg, path)
-        return cfg
-    with open(path, encoding='utf-8') as f:
-        user = json.load(f)
-    cfg.update(user)
+    try:
+        if not os.path.exists(path):
+            save_config(cfg, path)
+            return cfg
+        with open(path, encoding='utf-8') as f:
+            user = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ScrubError('Cannot use the rules file %s: %s' % (path, e))
+    if not isinstance(user, dict):
+        raise ScrubError('The rules file %s is not a JSON object.' % path)
+    # Keep only values of the right type; anything else falls back to the
+    # default, so a hand-edited file cannot crash a run.
+    for k, v in user.items():
+        d = DEFAULT_CONFIG.get(k)
+        if d is None:
+            cfg[k] = v                  # unknown key: keep it as it is
+            continue
+        if isinstance(d, bool):
+            ok = isinstance(v, bool)
+        elif isinstance(d, int):
+            if isinstance(v, str) and v.isdigit():
+                v = int(v)
+            ok = isinstance(v, int) and not isinstance(v, bool)
+        elif k == 'extensions' and isinstance(v, str):
+            v, ok = v.split(), True
+        else:
+            ok = isinstance(v, type(d))
+        if ok:
+            cfg[k] = v
+    cfg['extensions'] = ['.' + e.lstrip('*.').lower()
+                         for e in cfg['extensions'] if e.lstrip('*.')] \
+        or list(DEFAULT_CONFIG['extensions'])
+    if not isinstance(cfg['remaps'], dict):
+        cfg['remaps'] = copy.deepcopy(DEFAULT_CONFIG['remaps'])
     for k in REMAP_KINDS:
-        cfg['remaps'].setdefault(k, [])
+        if not isinstance(cfg['remaps'].get(k), list):
+            cfg['remaps'][k] = []
     return cfg
 
 
@@ -1212,29 +1243,45 @@ class Scrubber(object):
 
 # ---------------------------------------------------------------------- run
 
-def collect_files(inputs, exts, recurse=True):
-    """[(src, relative output dir)] for every matching file in inputs."""
+_SCRUBBED_STEM = re.compile(re.escape(SUFFIX) + r'(?:_\d+)?$')
+
+
+def collect_files(inputs, exts, recurse=True, skipped=None):
+    """[(src, relative output dir)] for every matching file in inputs.
+
+    Each file is listed once, even if given twice or inside a given folder.
+    Folders that cannot be read are added to skipped (a list) if given."""
     exts = tuple(e.lower() for e in exts)
-    found = []
+    found, seen = [], set()
 
     def want(name):
         stem, ext = os.path.splitext(name)
-        return ext.lower() in exts and not stem.endswith(SUFFIX)
+        return ext.lower() in exts and not _SCRUBBED_STEM.search(stem)
+
+    def add(path, rel):
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            found.append((path, rel))
+
+    def walk_error(e):
+        if skipped is not None:
+            skipped.append('%s (%s)' % (e.filename, e.strerror))
 
     for item in inputs:
         item = os.path.abspath(item)
         if os.path.isfile(item):
             if want(item):
-                found.append((item, ''))
+                add(item, '')
         elif os.path.isdir(item):
-            for root, dirs, files in os.walk(item):
+            for root, dirs, files in os.walk(item, onerror=walk_error):
                 dirs.sort()
                 if not recurse:
                     dirs[:] = []
                 for name in sorted(files):
                     if want(name):
-                        found.append((os.path.join(root, name),
-                                      os.path.relpath(root, item)))
+                        add(os.path.join(root, name),
+                            os.path.relpath(root, item))
         else:
             raise ScrubError('Not found: %s' % item)
     return found
@@ -1242,12 +1289,20 @@ def collect_files(inputs, exts, recurse=True):
 
 def default_paths(inputs):
     """Default output folder and report path for a list of inputs."""
-    first = os.path.abspath(inputs[0]).rstrip('\\/')
+    first = os.path.abspath(inputs[0])
     base = first if os.path.isdir(first) else os.path.dirname(first)
+    if os.path.dirname(base) == base:          # a drive root such as Q:\
+        drive = os.path.splitdrive(base)[0].rstrip(':') or 'root'
+        base = os.path.join(os.path.expanduser('~'), 'drive_%s' % drive)
+    base = base.rstrip('\\/')
     stamp = time.strftime('%Y%m%d-%H%M%S')
     out_dir = base + SUFFIX
     report = os.path.join(os.path.dirname(base), '%s_scrub_report_%s.csv'
                           % (os.path.basename(base), stamp))
+    n = 2
+    while os.path.exists(report):              # two runs in the same second
+        report = report[:-4].rsplit('~', 1)[0] + '~%d.csv' % n
+        n += 1
     return out_dir, report
 
 
@@ -1293,8 +1348,27 @@ def run(inputs, cfg, out_dir=None, report_path=None,
         _keep_awake(False)
 
 
+def _check_writable(path):
+    """Raise ScrubError now if path cannot be written (e.g. open in Excel),
+    rather than after a long run."""
+    if os.path.isdir(path):
+        raise ScrubError('The report path is a folder: %s' % path)
+    existed = os.path.exists(path)
+    try:
+        open(path, 'a').close()
+    except OSError as e:
+        raise ScrubError('Cannot write the report %s (%s). Is it open in '
+                         'another program?' % (path, e.strerror or e))
+    if not existed:
+        os.remove(path)
+
+
 def _run(inputs, cfg, out_dir, report_path, log, progress, cancel):
-    files = collect_files(inputs, cfg['extensions'], cfg['include_subfolders'])
+    skipped = []
+    files = collect_files(inputs, cfg['extensions'], cfg['include_subfolders'],
+                          skipped)
+    for s in skipped:
+        log('Warning: could not read folder %s' % s)
     if not files:
         raise ScrubError('No %s files found.' % ' / '.join(cfg['extensions']))
     d_out, d_rep = default_paths(inputs)
@@ -1307,6 +1381,16 @@ def _run(inputs, cfg, out_dir, report_path, log, progress, cancel):
     if _inside(report_path, out_dir):
         raise ScrubError('The report must not be inside the output folder '
                          '(it holds the original values).')
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        raise ScrubError('The output folder is a file: %s' % out_dir)
+    srcs = {os.path.normcase(p) for p, _ in files}
+    if os.path.normcase(report_path) in srcs:
+        raise ScrubError('The report path is one of the input files: %s'
+                         % report_path)
+    _check_writable(report_path)
+    if os.path.isdir(out_dir) and os.listdir(out_dir):
+        log('Note: the output folder already has files; files from earlier '
+            'runs are kept.')
 
     eng = Scrubber(cfg)                    # validates the rules up front
     sizes = [os.path.getsize(p) for p, _ in files]
@@ -1329,9 +1413,8 @@ def _run(inputs, cfg, out_dir, report_path, log, progress, cancel):
     # Each file's report rows go to a part file next to the report (they hold
     # original values, so not the system temp folder), merged in order.
     parts_dir = report_path + '.parts'
-    os.makedirs(parts_dir, exist_ok=True)
     used = set()
-    jobs, parts, shown_names = [], [], []
+    jobs, parts, shown_names, dsts = [], [], [], []
     for i, (src, rel) in enumerate(files):
         stem, ext = os.path.splitext(os.path.basename(src))
         dst = os.path.normpath(os.path.join(out_dir, rel, stem + SUFFIX + ext))
@@ -1341,38 +1424,69 @@ def _run(inputs, cfg, out_dir, report_path, log, progress, cancel):
                 out_dir, rel, '%s%s_%d%s' % (stem, SUFFIX, n, ext)))
             n += 1
         used.add(os.path.normcase(dst))
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
         shown = os.path.join(rel, os.path.basename(src)) if rel not in (
             '', '.') else os.path.basename(src)
+        if n > 2:                       # same name twice: say which output
+            shown += ' -> ' + os.path.basename(dst)
         part = os.path.join(parts_dir, '%04d.csv' % i)
         jobs.append((cfg, sorted(names), src, dst, part, shown))
         parts.append(part)
         shown_names.append(shown)
+        dsts.append(dst)
+
+    finished = set()
 
     def done(i, result):
+        finished.add(i)
         secs = max(result[1], 0.001)
         log('Scrubbed %s in %.1f s (%.1f MB/s)'
             % (shown_names[i], secs, sizes[i] / secs / 1e6))
 
     totals = {}
+    ok = False
     try:
+        os.makedirs(parts_dir, exist_ok=True)
+        for d in dsts:
+            os.makedirs(os.path.dirname(d), exist_ok=True)
         for file_totals, _ in _run_jobs(_scrub_job, jobs, sizes, workers,
                                         'Scrubbing', progress, cancel, done):
             for rule, n in file_totals.items():
                 totals[rule] = totals.get(rule, 0) + n
+        ok = True
     finally:
-        with open(report_path, 'w', encoding='utf-8-sig', newline='') as out:
-            csv.writer(out).writerow(Report.HEAD_DETAIL
-                                     if cfg['report_detail'] else Report.HEAD)
-            for part in parts:
-                if os.path.exists(part):
-                    with open(part, encoding='utf-8', newline='') as f:
-                        shutil.copyfileobj(f, out)
-                    os.remove(part)
+        if not ok:
+            # A cancelled, failed or killed file must not look finished.
+            for i, d in enumerate(dsts):
+                if i not in finished and os.path.exists(d):
+                    try:
+                        os.remove(d)
+                    except OSError:
+                        pass
         try:
-            os.rmdir(parts_dir)
-        except OSError:
-            pass
+            with open(report_path, 'w', encoding='utf-8-sig',
+                      newline='') as out:
+                w = csv.writer(out)
+                w.writerow(Report.HEAD_DETAIL if cfg['report_detail']
+                           else Report.HEAD)
+                for part in parts:
+                    if os.path.exists(part):
+                        with open(part, encoding='utf-8', newline='') as f:
+                            shutil.copyfileobj(f, out)
+                for s in skipped:
+                    w.writerow(['', 'Warning: folder not readable', s, '', '',
+                                ''] if not cfg['report_detail'] else
+                               ['', '', 'Warning: folder not readable', s, ''])
+        finally:
+            # The parts hold original values: never leave them behind.
+            for part in parts:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(parts_dir)
+            except OSError:
+                pass
     log('Output: %s' % out_dir)
     log('Report: %s' % report_path)
     return totals
@@ -1416,34 +1530,65 @@ def _in_worker():
 def _learn_job(cfg, src, progress, cancel):
     if _in_worker():
         _lower_priority()
-    return Scrubber(cfg).learn(src, progress, cancel)
+    progress(0)                         # tells the parent this worker's pid
+    try:
+        return Scrubber(cfg).learn(src, progress, cancel)
+    except OSError as e:
+        raise ScrubError('Cannot read %s (%s)' % (src, e.strerror or e))
 
 
 def _scrub_job(cfg, names, src, dst, part, shown, progress, cancel):
     """Scrub one file; its report rows go to part. Returns (totals, secs)."""
     if _in_worker():
         _lower_priority()
+    progress(0)                         # tells the parent this worker's pid
     eng = Scrubber(cfg)
     eng.set_learned(names)
-    rep = Report(part, cfg['report_detail'], part=True)
-    rep.start_file(shown)
-    t0 = time.time()
     try:
-        eng.scrub_file(src, dst, rep, progress, cancel)
-        rep.end_file()
-    finally:
-        rep.close()
+        rep = Report(part, cfg['report_detail'], part=True)
+        rep.start_file(shown)
+        t0 = time.time()
+        try:
+            eng.scrub_file(src, dst, rep, progress, cancel)
+            rep.end_file()
+        finally:
+            rep.close()
+    except OSError as e:
+        raise ScrubError('Cannot process %s (%s)' % (src, e.strerror or e))
     return rep.totals, time.time() - t0
 
 
 class _QueueProgress(object):
-    """Picklable progress callback for a worker process."""
+    """Picklable progress callback for a worker process. Each message also
+    carries the worker's pid, so the parent can notice a dead worker."""
 
     def __init__(self, q, i):
         self.q, self.i = q, i
 
     def __call__(self, done):
-        self.q.put((self.i, done))
+        self.q.put((self.i, done, os.getpid()))
+
+
+def _pid_alive(pid):
+    """True if process pid is still running."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return (k.GetExitCodeProcess(h, ctypes.byref(code))
+                    and code.value == 259)       # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    except AttributeError:                       # not Windows
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
 
 def _run_jobs(fn, jobs, sizes, workers, phase, progress, cancel,
@@ -1465,7 +1610,7 @@ def _run_jobs(fn, jobs, sizes, workers, phase, progress, cancel,
         results = []
         for i, job in enumerate(jobs):
             def cb(d, i=i):
-                done[i] = d
+                done[i] = max(done[i], d)
                 report()
             res = fn(*(job + (cb, cancel)))
             done[i] = sizes[i]
@@ -1486,14 +1631,27 @@ def _run_jobs(fn, jobs, sizes, workers, phase, progress, cancel,
             futs = {pool.submit(fn, *(job + (_QueueProgress(q, i), stop))): i
                     for i, job in enumerate(jobs)}
             pending = set(futs)
+            pids = {}                     # job -> worker pid (while running)
             try:
                 while pending:
                     fin, pending = cf.wait(pending, timeout=0.25)
                     while not q.empty():
-                        i, d = q.get_nowait()
+                        i, d, pid = q.get_nowait()
                         done[i] = max(done[i], d)
+                        pids[i] = pid
                     if cancel is not None and cancel.is_set():
                         stop.set()
+                    # The pool only notices a killed worker when the others
+                    # finish; check running jobs' workers directly.
+                    for f in pending:
+                        i = futs[f]
+                        if i in pids and f.running() and \
+                                not _pid_alive(pids[i]):
+                            raise ScrubError(
+                                'A worker process stopped unexpectedly '
+                                '(while on file %d of %d). Set "Files at '
+                                'once" to 1 (Removals tab) and run again.'
+                                % (i + 1, len(jobs)))
                     for f in fin:
                         i = futs[f]
                         try:
@@ -1508,7 +1666,10 @@ def _run_jobs(fn, jobs, sizes, workers, phase, progress, cancel,
                             on_done(i, results[i])
                     report()
             except BaseException:
-                stop.set()                        # stop the other files too
+                try:
+                    stop.set()                    # stop the other files too
+                except Exception:                 # manager already gone
+                    pass
                 for f in pending:
                     f.cancel()
                 raise
@@ -3274,13 +3435,19 @@ def main(argv=None):
     ap.add_argument('--detail', action='store_true',
                     help='report every occurrence, not unique values')
     ap.add_argument('--version', action='version', version=VERSION)
-    args = ap.parse_args(argv)
+    # Options between inputs (a.txt -o out b.txt) need 3.7+.
+    parse = getattr(ap, 'parse_intermixed_args', ap.parse_args)
+    args = parse(argv)
 
     if not args.inputs:
         return gui(args.rules)
 
     _no_quick_edit()
-    cfg = load_config(args.rules)
+    try:
+        cfg = load_config(args.rules)
+    except ScrubError as e:
+        _say(sys.stderr, 'Error: %s\n' % e)
+        return 1
     if args.no_learn:
         cfg['learn_accounts'] = False
     if args.detail:
@@ -3292,23 +3459,33 @@ def main(argv=None):
         now = time.time()
         if now - state['t'] >= 0.5 or done >= total:
             state['t'] = now
-            sys.stderr.write('\r%s %s  %5.1f%%   ' % (
+            _say(sys.stderr, '\r%s %s  %5.1f%%   ' % (
                 phase, name[-40:], 100.0 * done / max(total, 1)))
-            sys.stderr.flush()
 
     def log(msg):
-        sys.stderr.write('\r' + ' ' * 70 + '\r')
-        print(msg)
+        _say(sys.stderr, '\r' + ' ' * 70 + '\r')
+        _say(sys.stdout, msg + '\n')
 
     try:
         totals = run(args.inputs, cfg, args.output, args.report,
                      log=log, progress=progress)
     except (ScrubError, Cancelled) as e:
-        sys.stderr.write('\nError: %s\n' % e)
+        _say(sys.stderr, '\nError: %s\n' % (e or 'cancelled'))
+        return 1
+    except OSError as e:
+        _say(sys.stderr, '\nError: %s\n' % e)
         return 1
     for rule in sorted(totals):
-        print('  %-40s %d' % (rule, totals[rule]))
+        _say(sys.stdout, '  %-40s %d\n' % (rule, totals[rule]))
     return 0
+
+
+def _say(stream, text):
+    """Write text even if the console or a redirect cannot encode it (e.g. a
+    file name in another script when output goes to a cp1252 file)."""
+    enc = getattr(stream, 'encoding', None) or 'utf-8'
+    stream.write(text.encode(enc, 'replace').decode(enc, 'replace'))
+    stream.flush()
 
 
 if __name__ == '__main__':
