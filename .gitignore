@@ -1,0 +1,21 @@
+# Real rules (prefixes, hostnames) never leave this PC
+scrub_rules.json
+
+# Inputs, scrubbed outputs and reports
+input/
+*_scrubbed/
+*_scrubbed.*
+*_scrub_report*.csv
+
+# Large generated test files
+samples/big/
+
+__pycache__/
+*.pyc
+
+# Dev-only docs, kept local
+DESIGN.md
+
+# Dev-only tests and tools, kept local
+tests/
+tools/
